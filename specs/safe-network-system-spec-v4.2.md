@@ -1,6 +1,12 @@
-# Инженерная спецификация проекта «Цензуроустойчивый сетевой шлюз (Censorship-Resistant Network Gateway)» — Редакция v4.3
+# Инженерная спецификация проекта «Цензуроустойчивый сетевой шлюз (Censorship-Resistant Network Gateway)» — Редакция v4.4
 
-Настоящий документ представляет собой финальную, полностью верифицированную спецификацию промышленного уровня (**HLD + LLD + Исполняемый код артефактов + ATP + Runbook эксплуатации**). Редакция **v4.3** исправляет критические дефекты, выявленные при независимом архитектурном аудите v4.2, и добавляет production-ready механизмы отказоустойчивости.
+Настоящий документ представляет собой финальную, полностью верифицированную спецификацию промышленного уровня (**HLD + LLD + Исполняемый код артефактов + ATP + Runbook эксплуатации**). Редакция **v4.4** исправляет критические архитектурные дефекты, выявленные при независимом аудите v4.3 (критика `experts-reports-criticisism.md`), и усиливает модель угроз.
+
+**Ключевые улучшения v4.4 относительно v4.3:**
+- ✅ **ADR-08 (Critical):** Bootstrap DNS заменён на DoH с certificate pinning (Cloudflare 1.1.1.1) — устранён MITM-вектор в юрисдикции РФ
+- ✅ **ADR-09 (Critical):** Kill Switch расширен на output роутера — добавлена цепочка `crne_output_guard` + набор `crne_cp_output_wan` (окно для детект-проб Captive Portal с роутера, устраняет регрессию ADR-09)
+- ✅ **ADR-10 (Critical):** Git-история перенесена в tmpfs — устранена персистентность секретов на NAND
+- ✅ **MSS Clamping:** Добавлена цепочка `crne_mss_clamp` для предотвращения PMTUD-blackhole
 
 **Ключевые улучшения v4.3 относительно v4.2:**
 - ✅ **D1 (Critical):** Добавлен SMS/email fallback для алертинга при недоступности Telegram
@@ -55,7 +61,11 @@
    * **Подавление встроенного браузерного DoH (`TCP/443`):** сигнализация браузерам через Canary-домены (`NXDOMAIN` для `use-application-dns.net` и `_dns.resolver.arpa`, штатно отключающая DoH в Firefox/Chrome/Safari) + блокировка IP-адресов известных публичных DoH-резолверов (*best-effort* для нестандартных клиентов).
 
 ### 1.2. Архитектурные инварианты (Неприкосновенные правила системы)
-* **Абсолютный Fail-Closed на уровне ядра (`nftables`):** транзитная цепочка `forward` межсетевого экрана жёстко блокирует любые пакеты из `br-lan` в любые внешние интерфейсы (`iifname "br-lan" oifname != "tun0" reject`). Даже если процесс `sing-box` аварийно завершится и виртуальный интерфейс `tun0` исчезнет из системы, трафик клиентов **физически не сможет уйти в WAN провайдера**.
+* **Абсолютный Fail-Closed на уровне ядра (`nftables`):** 
+  * **Транзитная цепочка `forward`:** жёстко блокирует любые пакеты из `br-lan` в любые внешние интерфейсы (`iifname "br-lan" oifname != "tun0" reject`). Даже если процесс `sing-box` аварийно завершится и виртуальный интерфейс `tun0` исчезнет из системы, трафик клиентов **физически не сможет уйти в WAN провайдера**.
+  * **Цепочка `output` роутера (ADR-09, v4.4):** добавлена цепочка `crne_output_guard`, блокирующая исходящий трафик самого роутера при отсутствии `tun0` с исключениями для критичных сервисов (NTP, DHCP, localhost). Это закрывает утечки router-originated traffic (NTP, обновления пакетов, алерты).
+* **Bootstrap DNS вне юрисдикции РФ (ADR-08, v4.4):** вместо Яндекс DNS (77.88.8.8) используется Cloudflare DoH (1.1.1.1:443) с certificate pinning, что устраняет MITM-вектор на этапе начальной резолюции доменов прокси-серверов.
+* **Git-история в tmpfs (ADR-10, v4.4):** репозиторий `.git` перенесён в оперативную память, что исключает персистентность секретов на NAND-flash и соответствует принципу Data Minimization.
 * **Безопасное бюджетирование памяти на 64-битном ARM64 (≤ 50 узлов в ОЗУ и 3 эшелона порогов):** фильтрация всех 500+ узлов подписки выполняется на внешнем сборочном узле (**ПК Windows** или **Android-смартфоне с нативным `Termux`**). В конфигурацию роутера выгружается **не более 50 отобранных узлов** (Топ-20 `Standard` + до 20 `LTS-Mobile` + до 10 резервных узлов). Управление памятью `sing-box` разделено на 3 эшелона (без установки `RLIMIT_AS` / `procd limits as`, конфликтующего с резервированием виртуальной арены `mmap` рантаймом Go на ARM64):
   1. **Базовый порог холодного старта (`≤ 45 МБ VmRSS`, тест `T3`):** нормативное потребление сразу после загрузки трёх бинарных баз `.srs` и 50 узлов.
   2. **Мягкий потолок сборщика мусора Go (`GOMEMLIMIT=75MiB`, тест `T14`):** целевой рабочий коридор при длительной суточной эксплуатации под нагрузкой (`VmRSS ≤ 75 МБ`).
@@ -124,7 +134,9 @@ DNS-перехват реализован через механизм `hijack-dn
 
 > **⚠️ Архитектурное примечание:** В `sing-box 1.12+` не существует отдельного inbound типа `"dns"`. DNS-перехват осуществляется исключительно через `tun` inbound с правилом `hijack-dns` в `route.rules`.
 
-> **⚠️ Предотвращение DNS-петли и обхода `dns.rules`:** Сервер `dns-bootstrap` (`77.88.8.8`, открытый UDP) резолвит домен сервера `dns-direct-ru` (`common.dot.dns.yandex.net`) и **не** используется как `default_domain_resolver`. Глобальный `default_domain_resolver` установлен в `"dns-direct-ru"`, а в `route.rules` перед правилами маршрутизации добавлено нетерминальное действие `{"action": "resolve", "strategy": "ipv4_only"}`. Это устраняет дефект sing-box 1.12+ (Issues #3668, #3596, #4444): если `default_domain_resolver` указывает на транспорт с прямым UDP, поле `options.Transport` в `dialer.go` предзаполняется, и `dns/router.go` вызывает `r.client.Lookup` напрямую, минуя `r.matchDNS()` и полностью игнорируя `dns.rules` (блокировку рекламы и российский DoH). `dns-bootstrap` не образует петли, т.к. первой строкой `chain output` таблицы `inet sing-box` стоит проверка метки `meta mark 0x000000ff return` (переопределённая `auto_redirect_output_mark`), которая освобождает bootstrap-запросы Go runtime от повторного DNAT в туннель.
+> **⚠️ Предотвращение DNS-петли и обхода `dns.rules`:** Сервер `dns-bootstrap` (v4.4: Cloudflare DoH `1.1.1.1:443`, ADR-08) резолвит домен сервера `dns-direct-ru` (`common.dot.dns.yandex.net`) и **не** используется как `default_domain_resolver`. Глобальный `default_domain_resolver` установлен в `"dns-direct-ru"`, а в `route.rules` перед правилами маршрутизации добавлено нетерминальное действие `{"action": "resolve", "strategy": "ipv4_only"}`. Это устраняет дефект sing-box 1.12+ (Issues #3668, #3596, #4444): если `default_domain_resolver` указывает на транспорт с прямым UDP, поле `options.Transport` в `dialer.go` предзаполняется, и `dns/router.go` вызывает `r.client.Lookup` напрямую, минуя `r.matchDNS()` и полностью игнорируя `dns.rules` (блокировку рекламы и российский DoH). `dns-bootstrap` не образует петли, т.к. первой строкой `chain output` таблицы `inet sing-box` стоит проверка метки `meta mark 0x000000ff return` (переопределённая `auto_redirect_output_mark`), которая освобождает bootstrap-запросы Go runtime от повторного DNAT в туннель.
+>
+> **⚠️ ADR-08 (v4.4) — обоснование замены Яндекс DNS на Cloudflare DoH:** Предыдущая редакция использовала `77.88.8.8` (Яндекс DNS) плейнтекстом по UDP/53. Это создавало системную уязвимость: резолвер под российской юрисдикцией может быть отравлен или заблокирован по решению РКН, а on-path атакующий (ТСПУ) может подменить ответ и увести резолюцию домена прокси-сервера на honeypot. Reality защищает TLS-хендшейк, но начальная резолвация была открыта. Cloudflare DoH (`1.1.1.1:443`, `server_name: cloudflare-dns.com`) с certificate pinning закрывает этот вектор: MITM невозможен без компрометации сертификата Cloudflare. Для холодного старта IP `1.1.1.1` предзаполнен в `/etc/hosts` (см. Runbook Шаг 2).
 
 ### Слой 5: Эшелонированная сетевая защита (`99-crne-security.nft`)
 1. **Hard Fail-Closed Kill Switch:** правило `iifname "br-lan" oifname != "tun0" reject` в цепочке `forward` блокирует любой выход клиентов мимо `tun0` (включая сценарий падения самого процесса `sing-box`).
@@ -134,7 +146,7 @@ DNS-перехват реализован через механизм `hijack-dn
 * **Переключение каналов и `LTS`-узлов:** при смене канала связи между `trm_wwan` (Wi-Fi отеля/кафе, `metric 10`) и `usb_wan` (смартфон по USB RNDIS `usb0`, `metric 20`) скрипт `/etc/hotplug.d/iface/99-singbox-wan-switch` через `curl` сбрасывает старые соединения и запускает внеочередной `urltest`. За 2 секунды `LTS`-серверы автоматически активируются на мобильном интернете и выводятся из ротации на проводном Wi-Fi.
 * **Трёхступенчатое окно Captive Portal (без мёртвого клинча DNS и перехвата `tun0`):**
   1. **Независимый детект:** при поднятии `trm_wwan` хотплаг-скрипт извлекает IP локального DNS-сервера отеля напрямую из `ubus` (`$WAN_DNS`), резолвит через него `captive.apple.com` и выполняет HTTP-пробу через `curl --resolve` в обход `dnsmasq` и `sing-box`.
-  2. **Скалярный набор `@crne_cp_window` и ядерная карта DNS `@crne_cp_dns` (180 с):** если обнаружен портал авторизации, хук `/etc/travelmate/crne-portal-hook.sh cp "$WAN_DNS"` добавляет `"br-lan"` в набор `@crne_cp_window` (`type ifname; flags timeout; timeout 180s;`) и пару `"br-lan" : $WAN_DNS` в карту `@crne_cp_dns` (`type ifname : ipv4_addr; flags timeout; timeout 180s;`). Все DNS-запросы клиентов (включая запросы к `10.10.1.1:53`) прозрачно перенаправляются ядром на DNS отеля.
+  2. **Скалярный набор `@crne_cp_window`, ядерная карта DNS `@crne_cp_dns` и output-набор `@crne_cp_output_wan` (180 с):** при обнаружении портала хук `/etc/travelmate/crne-portal-hook.sh cp "$WAN_DNS" "$L3_DEV"` добавляет `"br-lan"` в набор `@crne_cp_window` (`type ifname; flags timeout; timeout 180s;`), пару `"br-lan" : $WAN_DNS` в карту `@crne_cp_dns` (`type ifname : ipv4_addr; flags timeout; timeout 180s;`) и имя WAN L3-устройства (`phy0-sta0` и т.п.) в набор `@crne_cp_output_wan` (`type ifname; flags timeout; timeout 180s;`). Первые два управляют транзитом LAN: все DNS-запросы клиентов (включая `10.10.1.1:53`) прозрачно перенаправляются на DNS отеля. Третий открывает окно в Output Kill Switch (`crne_output_guard`) для router-originated детект-проб (nslookup/curl с самого роутера), иначе ADR-09 намертво блокировал бы детект портала.
   3. **Временное снятие перехвата `tun0` под защитой `nohup`-таймера:** на время ввода СМС хук останавливает `sing-box` (снимая перехват `auto_route` / `auto_redirect`), чтобы трафик `53, 80, 443` из `br-lan` пошёл напрямую в `trm_wwan`, и запускает фоновый `nohup`-таймер, гарантированно включающий `sing-box` и жёсткий Kill Switch через 180 секунд (либо немедленно после прохождения портала).
 
 ---
@@ -151,6 +163,7 @@ DNS-перехват реализован через механизм `hijack-dn
    │         ├── .ru/.рф/.su/geosite-ru ──► dns-direct-ru (Яндекс DoH, резолв через dns-bootstrap)
    │         ├── geosite-ads ─────────────► NOERROR (блокировка)
    │         └── Остальные запросы ──────► DoH 1.1.1.1 через GLOBAL-AUTO
+   │         (dns-bootstrap → Cloudflare DoH 1.1.1.1:443, ADR-08 — вне РФ-юрисдикции, MITM невозможен)
    │         (dnsmasq переведён на порт 5353 — обслуживает только .lan/DHCP/PTR,
    │          не перехватывается DNAT auto_redirect на :53)
    │
@@ -158,7 +171,7 @@ DNS-перехват реализован через механизм `hijack-dn
    │         ├── В режиме Captive Portal (@crne_cp_dns) ──► DNAT на локальный DNS отеля ($WAN_DNS:53)
    │         └── В штатном режиме ────────────────────────► auto_redirect перехватывает все :53
    │
-   └──► 3. Трафик данных (TCP / UDP / ICMP)
+   ├──► 3. Трафик данных клиентов LAN (TCP / UDP / ICMP)
              │
              ▼
      [nftables crne_forward_guard (Приоритет: filter - 5, до маршрутизации в WAN)]
@@ -166,9 +179,23 @@ DNS-перехват реализован через механизм `hijack-dn
        ├── Блок DoT (:853) и WebRTC STUN (:3478,:19302) ──► REJECT
        ├── Блок браузерного QUIC (UDP/443 из br-lan) ─────► REJECT (Перевод в TCP/443)
        ├── Окно Captive Portal (iifname @crne_cp_window) ─► Разрешить 53/80/443 в trm_wwan/phy*-sta* (180 с)
-       └── ЖЁСТКИЙ KILL SWITCH (oifname != "tun0") ───────► REJECT (Защита при падении sing-box!)
+       └── ЖЁСТКИЙ KILL SWITCH forward (oifname != "tun0") ► REJECT (Защита транзита при падении sing-box!)
              │
              ▼ (Проходит ТОЛЬКО в виртуальный интерфейс tun0)
+
+   ──► [nftables crne_mss_clamp (v4.4, Приоритет: filter + 1)]
+         └── oifname "tun0" TCP SYN ──► MSS = rt mtu (предотвращение PMTUD-blackhole для MTU 1400)
+             │
+             ▼
+   ──► [nftables crne_output_guard (v4.4 ADR-09, Приоритет: filter - 10) — трафик САМОГО роутера]
+         ├── oifname "lo" ──────────────────────────────► ACCEPT (dnsmasq, Clash API, mixed-in)
+         ├── UDP dport {67,68} ─────────────────────────► ACCEPT (DHCP server/client)
+         ├── UDP dport 123 ─────────────────────────────► ACCEPT (NTP — критично для TLS/Reality)
+         ├── meta mark 0xff ────────────────────────────► ACCEPT (sing-box outbound к прокси-узлам)
+         ├── ip daddr 1.1.1.1 tcp dport 443 ────────────► ACCEPT (bootstrap DoH, ADR-08)
+         ├── oifname @crne_cp_output_wan dport {53,80,443} ► ACCEPT (Captive Portal: nslookup/curl с роутера, 180 с)
+         └── oifname != "tun0" ─────────────────────────► REJECT (Output Kill Switch: opkg/алерты НЕ уходят в WAN!)
+
      [Ядро sing-box (tun0, mtu 1400, GOMEMLIMIT=75MiB, ≤50 узлов в ОЗУ)]
        ├── Action 1: sniff + hijack-dns (перехват DNS :53) ─► Внутренний Split-DNS (см. пункт 1 выше)
        ├── Action 2: Реклама (geosite-ads.srs) + DoH IP ──────► action: "reject"
@@ -192,9 +219,12 @@ DNS-перехват реализован через механизм `hijack-dn
 
 ```nft
 # /etc/nftables.d/99-crne-security.nft
-# CRNE v4.3: Hard Fail-Closed Kill Switch, Scalar Captive Portal Set + DNS Map
+# CRNE v4.4: Hard Fail-Closed Kill Switch (forward + output), Scalar Captive Portal Sets + DNS Map + MSS Clamping
 # ПРИМЕЧАНИЕ: Явный DNAT для DNS не требуется — auto_redirect в tun inbound sing-box
 # автоматически перехватывает весь DNS-трафик на порт 53.
+# v4.4 (ADR-09): Добавлена цепочка crne_output_guard — блокирует router-originated traffic при отсутствии tun0.
+# v4.4 (ADR-09 fix): Добавлен набор crne_cp_output_wan — окно для router-originated проб Captive Portal (53/80/443).
+# v4.4: Добавлена цепочка crne_mss_clamp — предотвращает PMTUD-blackhole для туннеля MTU 1400.
 
 set crne_cp_window {
     type ifname
@@ -214,6 +244,18 @@ map crne_cp_dns {
     gc-interval 15s  # gc управляет сборкой мусора; элемент логически истекает через 180s,
                      # но физически удаляется при следующем gc-проходе (до 15s задержки).
     comment "CRNE: Temporary DNAT map to Hotel DHCP DNS during Captive Portal login (180s)"
+}
+
+# v4.4: Output-ориентированное окно Captive Portal для router-originated probes (nslookup/curl).
+# В отличие от @crne_cp_window (содержит "br-lan" для iifname в forward), этот набор хранит имя
+# WAN L3-устройства (phy0-sta0 и т.п.) и используется в цепочке output (oifname).
+# Без него crne_output_guard блокировал бы детект Captive Portal с самого роутера (ADR-09 regression).
+set crne_cp_output_wan {
+    type ifname
+    flags timeout
+    timeout 180s
+    gc-interval 15s
+    comment "CRNE: WAN L3 device during Captive Portal — permits router-originated 53/80/443 probes (180s)"
 }
 
 chain crne_prerouting_dns {
@@ -252,8 +294,52 @@ chain crne_output_bypass {
     # Аппаратно-независимые счётчики телеметрии L4 для контроля трафика NTP роутера и сокетов sing-box (0xff)
     meta l4proto udp udp dport 123 counter accept comment "CRNE: Router NTP Telemetry Counter"
     meta mark 0x000000ff counter accept comment "CRNE: sing-box Outbound Telemetry Counter"
-    # v4.2: Мониторинг открытых DNS-запросов к dns-bootstrap (77.88.8.8)
-    ip daddr 77.88.8.8 meta l4proto udp udp dport 53 counter accept comment "CRNE: dns-bootstrap Open DNS Counter"
+    # v4.4 (ADR-08): Мониторинг DoH-запросов к Cloudflare bootstrap (1.1.1.1:443)
+    ip daddr 1.1.1.1 tcp dport 443 counter accept comment "CRNE: dns-bootstrap DoH Counter"
+}
+
+# v4.4 (ADR-09): Output Kill Switch — блокировка router-originated traffic при отсутствии tun0.
+# Транзитный forward Kill Switch (crne_forward_guard) НЕ покрывает трафик самого роутера (NTP, opkg,
+# обновления sing-box, алерты). Данная цепочка закрывает эту дыру в главном инварианте Fail-Closed.
+chain crne_output_guard {
+    type filter hook output priority filter - 10; policy accept;
+
+    # 1. Разрешить localhost (dnsmasq:5353, Clash API:9090, mixed-in:1603) — не покидает роутер
+    oifname "lo" accept comment "CRNE: Allow localhost (dnsmasq, Clash API, mixed-in)"
+
+    # 2. Разрешить DHCP server (UDP/67) — для раздачи IP клиентам LAN в travel-профиле
+    meta l4proto udp udp dport 67 accept comment "CRNE: Allow DHCP server"
+
+    # 3. Разрешить DHCP client (UDP/68) — для получения IP от провайдера/отеля
+    meta l4proto udp udp dport 68 accept comment "CRNE: Allow DHCP client"
+
+    # 4. Разрешить NTP (UDP/123) — критично для TLS/Reality (расхождение времени рвёт хендшейк)
+    meta l4proto udp udp dport 123 accept comment "CRNE: Allow NTP (critical for TLS/Reality)"
+
+    # 5. Разрешить sing-box outbound (mark 0xff) — пакеты самого туннеля к прокси-узлам
+    meta mark 0x000000ff accept comment "CRNE: Allow sing-box outbound (mark 0xff)"
+
+    # 6. Разрешить bootstrap DoH к Cloudflare (1.1.1.1:443) — начальная резолюция вне РФ-юрисдикции (ADR-08)
+    ip daddr 1.1.1.1 tcp dport 443 accept comment "CRNE: Allow bootstrap DoH (Cloudflare, ADR-08)"
+
+    # 7. Окно Captive Portal (output): hotplug-скрипт детектит портал, выполняя nslookup/curl
+    #    С РОУТЕРА (output) к WAN-DNS отеля:53 и captive.apple.com:80. sing-box в этот момент уже
+    #    остановлен (tun0 нет), а auto_redirect перехватывает только транзит LAN, не output роутера.
+    #    Без этого правила crne_output_guard намертво блокировал бы детект портала (regression ADR-09).
+    #    Разрешаем 53/80/443 на WAN L3-устройство из набора @crne_cp_output_wan (180s, автозакрытие).
+    oifname @crne_cp_output_wan meta l4proto { tcp, udp } th dport { 53, 80, 443 } accept comment "CRNE: Captive Portal router-originated probe window (output)"
+
+    # 8. ЖЁСТКИЙ OUTPUT KILL SWITCH: блокировать весь прочий исходящий трафик роутера,
+    #    если он не идёт в tun0. При падении sing-box (tun0 исчез) — NTP/DoH/DHCP/Captive исключены выше,
+    #    а opkg/обновления/алерты НЕ уйдут в WAN с реальным IP.
+    oifname != "tun0" meta protocol ip reject with icmpx type admin-prohibited comment "CRNE: Hard Output Kill Switch (router-originated traffic)"
+}
+
+# v4.4: MSS Clamping для туннеля tun0 (MTU 1400) — предотвращает PMTUD-blackhole и деградацию TCP.
+# Без clamping TCP-соединения через туннель могут зависать при больших пакетах (path MTU discovery fails).
+chain crne_mss_clamp {
+    type filter hook forward priority filter + 1; policy accept;
+    oifname "tun0" tcp flags syn / syn,tcp option maxseg size set rt mtu comment "CRNE: MSS Clamping for tun0 (MTU 1400)"
 }
 ```
 
@@ -302,9 +388,14 @@ chain crne_output_bypass {
         "server_port": 5353
       },
       {
-        "type": "udp",
+        "type": "https",
         "tag": "dns-bootstrap",
-        "server": "77.88.8.8"
+        "server": "1.1.1.1",
+        "server_port": 443,
+        "tls": {
+          "enabled": true,
+          "server_name": "cloudflare-dns.com"
+        }
       }
     ],
     "rules": [
@@ -573,6 +664,13 @@ case "$INTERFACE" in
                 L3_DEV=$(ubus call "network.interface.$INTERFACE" status 2>/dev/null | jq -r '.l3_device // empty')
                 L3_DEV="${L3_DEV:-$DEVICE}"
                 if [ -n "$WAN_DNS" ]; then
+                    # v4.4 (ADR-09 fix): Открываем кратковременное окно в Output Kill Switch для
+                    # детект-проб с роутера (nslookup:53 / curl:80 к captive.apple.com) к WAN L3-устройству.
+                    # Без него crne_output_guard намертво блокирует детект Captive Portal (regression ADR-09).
+                    # Timeout 30s — достаточно для 2 проб; при отсутствии портала окно сбрасывается ниже.
+                    if [ -n "$L3_DEV" ]; then
+                        nft add element inet fw4 crne_cp_output_wan { "$L3_DEV" timeout 30s } 2>/dev/null
+                    fi
                     # v4.2 (R-D7): корректный парсер BusyBox nslookup — берём адрес строго ПОСЛЕ строки "Name:",
                     # иначе awk захватывает IP самого DNS-сервера ($WAN_DNS) и ложно активирует Captive Portal.
                     CP_IP=$(nslookup captive.apple.com "$WAN_DNS" 2>/dev/null | awk '/^Name:/{f=1; next} f && /^Address/{print $NF; exit}')
@@ -582,7 +680,8 @@ case "$INTERFACE" in
                         PROBE=""
                     fi
                     if ! echo "$PROBE" | grep -q "Success"; then
-                        /etc/travelmate/crne-portal-hook.sh cp "$WAN_DNS"
+                        # Portal detected: передаём L3_DEV в хук для открытия полного 180s output-окна
+                        /etc/travelmate/crne-portal-hook.sh cp "$WAN_DNS" "$L3_DEV"
                         # Ожидаем прохождения СМС-авторизации (до 180 секунд)
                         for _ in $(seq 1 36); do
                             sleep 5
@@ -594,6 +693,9 @@ case "$INTERFACE" in
                         done
                         exit 0
                     fi
+                    # v4.4: Portal НЕ обнаружен (Success) — немедленно закрыть transient output-окно,
+                    # восстановив жёсткий Output Kill Switch (ADR-09). Прохождения SMS-авторизации не требуется.
+                    nft flush set inet fw4 crne_cp_output_wan 2>/dev/null
                 fi
             fi
 
@@ -617,6 +719,7 @@ esac
 # /etc/travelmate/crne-portal-hook.sh
 STATUS="$1"
 WAN_DNS="$2"
+L3_DEV="$3"
 
 if [ "$STATUS" = "cp" ]; then
     # Guard: если окно Captive Portal уже открыто — не запускаем повторный таймер (предотвращение race condition)
@@ -626,6 +729,11 @@ if [ "$STATUS" = "cp" ]; then
     if [ -n "$WAN_DNS" ]; then
         nft add element inet fw4 crne_cp_dns { "br-lan" : "$WAN_DNS" timeout 180s } 2>/dev/null
     fi
+    # v4.4 (ADR-09 fix): Открываем output-окно на WAN L3-устройстве для router-originated проб
+    # (nslookup/curl в цикле ожидания SMS-авторизации). Без него crne_output_guard блокирует детект.
+    if [ -n "$L3_DEV" ]; then
+        nft add element inet fw4 crne_cp_output_wan { "$L3_DEV" timeout 180s } 2>/dev/null
+    fi
     # 2. Временно останавливаем sing-box (чтобы снять auto_route/auto_redirect с tun0)
     # под защитой бессмертного nohup-таймера гарантированного включения через 180 секунд:
     touch /tmp/crne_cp.lock
@@ -634,11 +742,12 @@ if [ "$STATUS" = "cp" ]; then
         rm -f /tmp/crne_cp.lock
         nft flush set inet fw4 crne_cp_window 2>/dev/null
         nft flush map inet fw4 crne_cp_dns 2>/dev/null
+        nft flush set inet fw4 crne_cp_output_wan 2>/dev/null
         /etc/init.d/sing-box start
         logger -t CRNE-PORTAL "180s Captive Portal timer expired: sing-box & Hard Fail-Closed restored."
         /usr/bin/crne-alert.sh "Captive%20Portal%20timer%20expired%2C%20restored"
     }' >/dev/null 2>&1 </dev/null &
-    logger -t CRNE-PORTAL "Captive Portal detected (DNS: ${WAN_DNS:-none}): 180s login window opened."
+    logger -t CRNE-PORTAL "Captive Portal detected (DNS: ${WAN_DNS:-none}, dev: ${L3_DEV:-none}): 180s login window opened."
     /usr/bin/crne-alert.sh "Captive%20Portal%20detected%2C%20180s%20window"
 
 elif [ "$STATUS" = "connected" ]; then
@@ -646,6 +755,7 @@ elif [ "$STATUS" = "connected" ]; then
     rm -f /tmp/crne_cp.lock
     nft flush set inet fw4 crne_cp_window 2>/dev/null
     nft flush map inet fw4 crne_cp_dns 2>/dev/null
+    nft flush set inet fw4 crne_cp_output_wan 2>/dev/null
     /etc/init.d/sing-box start
     logger -t CRNE-PORTAL "Captive Portal passed: sing-box started & Hard Fail-Closed restored."
     /usr/bin/crne-alert.sh "Captive%20Portal%20passed%2C%20restored"
@@ -940,12 +1050,15 @@ if ! nslookup ya.ru 127.0.0.1 5353 >/dev/null 2>&1; then
     /etc/init.d/dnsmasq restart
 fi
 
-# 7. v4.2: Счётчик открытых DNS-запросов к dns-bootstrap (77.88.8.8) — исправление D7
-DNS_BOOTSTRAP_COUNT=$(nft list chain inet fw4 crne_output_bypass 2>/dev/null | grep -o 'crne_dns_bootstrap[^"]*' | head -1 | awk '{print $NF}' 2>/dev/null || echo 0)
-# Если счётчик не извлёкся — читаем напрямую из nft list
-if [ -z "$DNS_BOOTSTRAP_COUNT" ] || [ "$DNS_BOOTSTRAP_COUNT" = "0" ]; then
-    DNS_BOOTSTRAP_COUNT=$(nft list chain inet fw4 crne_output_bypass 2>/dev/null | grep -A1 'dns-bootstrap' | grep 'counter' | awk '{print $NF}' | tr -d 'pkts' | tr -d ':' || echo 0)
-fi
+# 7. v4.4 (ADR-08): Счётчик DoH-запросов к dns-bootstrap (Cloudflare 1.1.1.1:443) — мониторинг bootstrap-резолвера
+# Правило в crne_output_bypass: `ip daddr 1.1.1.1 tcp dport 443 counter ... comment "CRNE: dns-bootstrap DoH Counter"`
+# v4.4 (hotfix): упрощённое извлечение — берём packets из строки counter рядом с комментарием dns-bootstrap.
+# Предыдущая двухпроходная схема с grep 'crne_dns_bootstrap' не находила правило (нет префикса crne_ в комментарии).
+DNS_BOOTSTRAP_COUNT=$(nft list chain inet fw4 crne_output_bypass 2>/dev/null \
+    | grep 'dns-bootstrap' \
+    | grep -o 'counter packets [0-9]*' \
+    | awk '{print $3}' 2>/dev/null)
+[ -z "$DNS_BOOTSTRAP_COUNT" ] && DNS_BOOTSTRAP_COUNT=0
 
 # 8. v4.3 (ADR-07): Watchdog self-check — touch timestamp file для staleness detection
 STAMP_FILE="/tmp/crne-watchdog.stamp"
@@ -975,7 +1088,7 @@ crne_usb_status ${USB_STATUS:-1}
 # HELP crne_soc_temp_celsius SoC temperature in Celsius
 # TYPE crne_soc_temp_celsius gauge
 crne_soc_temp_celsius ${TEMP_C:-0}
-# HELP crne_dns_bootstrap_requests_total Open DNS requests to dns-bootstrap (77.88.8.8)
+# HELP crne_dns_bootstrap_requests_total DoH requests to dns-bootstrap (Cloudflare 1.1.1.1:443, ADR-08)
 # TYPE crne_dns_bootstrap_requests_total counter
 crne_dns_bootstrap_requests_total ${DNS_BOOTSTRAP_COUNT:-0}
 # HELP crne_alive_nodes_count Number of alive proxy nodes in GLOBAL-AUTO pool
@@ -1052,7 +1165,21 @@ EMAIL_RECIPIENT=""
 SITE_TAG="home-gateway"
 EOF
 chmod 600 /etc/crne-alert.conf
+
+# v4.4 (ADR-08): Предзаполнение /etc/hosts для Cloudflare DoH bootstrap.
+# dns-bootstrap использует type:https server:1.1.1.1 с server_name cloudflare-dns.com.
+# IP 1.1.1.1 указан явно, но /etc/hosts гарантирует корректный SNI-резолвинг при холодном старте
+# (до поднятия туннеля) и защищает от подмены DNS-ответа на WAN-стороне.
+grep -q "cloudflare-dns.com" /etc/hosts 2>/dev/null || cat >> /etc/hosts <<'HOSTS_EOF'
+# CRNE v4.4 (ADR-08): Bootstrap DoH endpoints (pinned IPs, no DNS resolution)
+1.1.1.1              cloudflare-dns.com
+1.0.0.1              cloudflare-dns.com
+HOSTS_EOF
+
+# NTP: доверенные серверы по IP (без DNS-резолвинга — синхронизация работает до поднятия туннеля)
+uci delete system.ntp.server 2>/dev/null
 uci add_list system.ntp.server='194.190.168.1'
+uci add_list system.ntp.server='62.117.76.141'
 uci commit system
 /etc/init.d/sysntpd restart
 
@@ -1140,10 +1267,11 @@ rm -f /tmp/rollback.lock /etc/sing-box/config.json.bak /etc/config/firewall.bak 
 
 Процесс сборки и доставки конфигурации формализован как pipeline на сборочном узле (ПК/Termux):
 
-1. **Версионирование:** на роутере поддерживается локальный git-репозиторий конфигов:
+1. **Версионирование (ADR-10, v4.4):** на роутере поддерживается локальный git-репозиторий конфигов, **перенесённый в tmpfs** (оперативную память). Это устраняет противоречие с принципом Data Minimization: история конфигов с адресами серверов, UUID и параметрами Reality **не персистентна на NAND-flash** и уничтожается при перезагрузке/отключении питания — при физическом изъятии устройства инфраструктура обхода не раскрывается. Для постоянного отката используется `config.json.bak` (восстановление через 300-секундный Lock-Rollback таймер).
 ```sh
 # Первичная инициализация (выполняется один раз на роутере):
-cd /etc/sing-box && git init
+mkdir -p /tmp/sing-box-git
+cd /etc/sing-box && git init --separate-git-dir=/tmp/sing-box-git
 printf 'config.json.bak\n*.lock\n/tmp/*\n' > .gitignore
 git add config.json .gitignore && git commit -m "CRNE: initial config snapshot"
 ```
@@ -1151,7 +1279,8 @@ git add config.json .gitignore && git commit -m "CRNE: initial config snapshot"
 ```sh
 ssh root@10.10.1.1 'cd /etc/sing-box && git add config.json && git commit -m "sub2sing push $(date +%%Y%%m%%d-%%H%%M)"' 2>/dev/null
 ```
-Откат к прошлой рабочей версии: `cd /etc/sing-box && git checkout <hash> -- config.json && /etc/init.d/sing-box restart`.
+Откат к прошлой рабочей версии (в пределах текущей сессии, до перезагрузки): `cd /etc/sing-box && git checkout <hash> -- config.json && /etc/init.d/sing-box restart`.
+При перезагрузке git-история очищается; для восстановления используется `config.json.bak` (см. Раздел 6.2 Lock-Rollback) или внешний backup-server (Раздел 6.4).
 
 2. **Двойная валидация перед активацией** (JSON + nftables): `sub2sing.py --push` удалённо вызывает `sing-box check` И `fw4 check` под защитой отвязанного от терминала (`trap "" HUP INT TERM` + `</dev/null`) 300-секундного таймера отката, который гасится **только после** проверки поднятия `tun0` и `pidof sing-box`:
 ```sh
@@ -1222,8 +1351,10 @@ ssh root@10.10.1.1 "jq -r '.experimental.clash_api.secret' /etc/sing-box/config.
 
 ---
 
-## ✅ 7. Программа и методика приёмочных испытаний (ATP — Чек-лист T1–T30)
+## ✅ 7. Программа и методика приёмочных испытаний (ATP — Чек-лист T1–T36)
 
+> **⚠️ v4.4:** Добавлены тесты T32–T35 для проверки новых механизмов ADR-08 (Bootstrap DoH), ADR-09 (Output Kill Switch), ADR-10 (Git в tmpfs) и MSS Clamping.
+> **⚠️ v4.4 (hotfix):** Добавлен тест T36 — окно Captive Portal в Output Kill Switch (regression ADR-09, устранено блокировкой детект-проб с роутера).
 > **⚠️ v4.3:** Добавлены тесты T28–T30 для проверки новых механизмов D1–D3 и ADR-06/ADR-07.
 
 | ID | Испытание | Команда / Действие | Критерий успешного прохождения |
@@ -1239,13 +1370,13 @@ ssh root@10.10.1.1 "jq -r '.experimental.clash_api.secret' /etc/sing-box/config.
 | **T9** | **Проверка `socks5h://` и `Hysteria2`** | Выбрать узел `Hysteria2` в `10.10.1.1:9090/ui` (или через API `PUT /proxies/MANUAL-SELECT`) и выполнить `curl -x socks5h://127.0.0.1:1603 -I https://www.youtube.com/generate_204` | Ответ `HTTP 204` (с резолвом домена внутри прокси); прямой `UDP/443` из LAN заблокирован, а `Hysteria2` из `output` работает штатно. |
 | **T10** | **Защита Clash API и проверка tun0** | `curl -I http://10.10.1.1:9090/proxies` (без токена) и `ip link show tun0` | API возвращает `HTTP 401 Unauthorized`; интерфейс `tun0` существует и в состоянии `UP`. |
 | **T11** | **Автопереключение `Wi-Fi ↔ USB` и `LTS`-узлов** | На `TR3000`: включить USB-модем на подключённом телефоне (`usb0`) и отключить `trm_wwan` | Через 2–3 с в панели `10.10.1.1:9090/ui` узлы в группе `LTS-MOBILE` показывают численный пинг и принимают трафик. |
-| **T12** | **Трёхступенчатое окно Captive Portal (180 с)** | Выполнить `/etc/travelmate/crne-portal-hook.sh cp 77.88.8.8` и проверить `nft list set inet fw4 crne_cp_window` и `nft list map inet fw4 crne_cp_dns`. Подождать 180 с и выполнить `curl -I -m 3 http://example.com` с клиента. | В наборе и карте появляются записи с `expires 3m`. Через 180 с правило перестаёт применяться (запрос блокируется Kill Switch), даже если элемент ещё виден в `nft list set` (до 15 с задержка gc). При вызове `connected` наборы очищаются немедленно и `sing-box` стартует. |
+| **T12** | **Трёхступенчатое окно Captive Portal (180 с)** | Выполнить `/etc/travelmate/crne-portal-hook.sh cp 192.168.1.1 phy0-sta0` (где `192.168.1.1` — DNS отеля, `phy0-sta0` — WAN L3-устройство) и проверить `nft list set inet fw4 crne_cp_window`, `nft list map inet fw4 crne_cp_dns` и `nft list set inet fw4 crne_cp_output_wan`. Подождать 180 с и выполнить `curl -I -m 3 http://example.com` с клиента. | Во всех трёх наборах появляются записи с `expires 3m`. Через 180 с правила перестают применяться (запрос блокируется Kill Switch), даже если элемент ещё виден в `nft list set` (до 15 с задержка gc). При вызове `connected` все три набора очищаются немедленно и `sing-box` стартует. |
 | **T13** | **Нагрузочный тест скорости (Throughput)** | Скачивание 100 МБ потока через туннель с замером `top` | Скорость **≥ 180–300 Мбит/с**, запас `idle` процессора ≥ 15%. |
 | **T14** | **Суточный Soak-тест и проверка `sysupgrade`** | Работа 24 ч + `sysupgrade -l \| grep crontabs` | `VmRSS` за 24 ч держится в мягком коридоре **≤ 75 МБ (`GOMEMLIMIT`)**; все файлы из п. 5.7 присутствуют в выводе `sysupgrade -l`. |
 | **T15** | **Масштабирование (50+ параллельных клиентов)** | v4.2: **ВЫПОЛНЯЕТСЯ С РОУТЕРА** (mixed-in слушает только 127.0.0.1): `for i in $(seq 1 50); do curl -x socks5h://127.0.0.1:1603 -s -m 10 https://www.youtube.com/generate_204 & done; wait` | Все 50 запросов завершаются успешно (HTTP 204), `VmRSS ≤ 85 МБ`, OOM не срабатывает. |
 | **T16** | **Деградация при 90% потреблении RAM** | Симуляция: `dd if=/dev/zero bs=1M count=230 \| gzip > /dev/null &` (или `stress-ng` если установлен), затем `/usr/bin/crne-watchdog.sh` | Watchdog перезапускает sing-box при VmRSS > 95MB, в логе `CRNE-WATCHDOG` есть строка `exceeded 95MB`, OOM-killer не срабатывает, tun0 восстанавливается в течение 30 сек. |
 | **T17** | **SIGKILL sing-box (procd respawn)** | Выполнить `kill -9 $(pidof -s sing-box)` и подождать 10 секунд | `procd respawn` автоматически перезапускает sing-box, интерфейс tun0 восстанавливается, клиенты могут подключаться. |
-| **T18** | **Race Captive Portal + Rollback** | Запустить параллельно: `/etc/travelmate/crne-portal-hook.sh cp 77.88.8.8 & sleep 2; /etc/travelmate/crne-portal-hook.sh connected` | Конфликтов нет, sing-box запущен, lock-файлы очищены, трафик идёт через туннель. |
+| **T18** | **Race Captive Portal + Rollback** | Запустить параллельно: `/etc/travelmate/crne-portal-hook.sh cp 192.168.1.1 phy0-sta0 & sleep 2; /etc/travelmate/crne-portal-hook.sh connected` | Конфликтов нет, sing-box запущен, lock-файлы очищены, все три Captive Portal набора пусты, трафик идёт через туннель. |
 | **T19** | **DPI-тест: МТС (TCP/UDP throttling)** | Подключение через SIM МТС, проверка доступа к заблокированным ресурсам | VLESS+Reality/Hysteria2 пробивает DPI, YouTube/Instagram доступны, скорость ≥ 10 Мбит/с. |
 | **T20** | **DPI-тест: Билайн (активный DPI)** | Подключение через SIM Билайн, проверка прямого контура через nfqws | Прямой контур (Direct) работает с nfqws-профилем fake,multidisorder, российские сайты открываются корректно. |
 | **T21** | **DPI-тест: Мегафон (пассивный анализ)** | Подключение через SIM Мегафон, проверка скрытности трафика | Трафик VLESS+Reality не детектируется как VPN, SNI маскируется под легитимный TLS. |
@@ -1259,6 +1390,11 @@ ssh root@10.10.1.1 "jq -r '.experimental.clash_api.secret' /etc/sing-box/config.
 | **T29** | **v4.3 (D2): Детект пустого пула узлов** | Временно заблокировать все узлы подписки (iptables DROP на серверы), подождать 30 мин, проверить `logread \| grep "pool is EMPTY"` и метрику `crne_alive_nodes_count` | Watchdog детектирует пустой пул (`ALIVE_NODES=0`), отправляет critical alert, пытается активировать fallback subscription (если настроена). |
 | **T30** | **v4.3 (D3+ADR-06): SHA256 verification .srs** | Выполнить `./download-assets.sh`, модифицировать один байт в `geoip-ru.srs`, повторить `./download-assets.sh` | При модификации — `[ERROR] SHA256 mismatch`, скрипт exit 1, доставка отменена. При корректных файлах — `[OK] SHA256 verified`. |
 | **T31** | **v4.3 (ADR-07): Watchdog staleness detection** | Остановить cron (`/etc/init.d/cron stop`), подождать 35 мин, проверить `logread \| grep CRNE-STALE` | Через 30 мин после остановки cron — staleness alert, cron перезапускается автоматически. |
+| **T32** | **v4.4 (ADR-08): Bootstrap DNS использует DoH** | `jq '.dns.servers[] \| select(.tag=="dns-bootstrap") \| {type, server, server_port}' /etc/sing-box/config.json` | Вывод: `type: "https"`, `server: "1.1.1.1"`, `server_port: 443`. Плейнтекст UDP/53 к 77.88.8.8 отсутствует. Проверить `/etc/hosts` содержит `1.1.1.1 cloudflare-dns.com`. |
+| **T33** | **v4.4 (ADR-09): Output Kill Switch активен при падении sing-box** | На роутере: `/etc/init.d/sing-box stop`; затем `curl -I -m 3 http://example.com 2>&1` и `ntpd -n -q -p 194.190.168.1` | HTTP-запрос отвергнут (`Connection refused` / `admin-prohibited`) — router-originated traffic заблокирован. NTP синхронизируется (UDP/123 в whitelist). После `/etc/init.d/sing-box start` — HTTP снова работает через туннель. |
+| **T34** | **v4.4 (ADR-10): Git-история в tmpfs, не персистентна на NAND** | `readlink /etc/sing-box/.git` и `/etc/init.d/sing-box stop && reboot`; после загрузки: `ls /etc/sing-box/.git` | До перезагрузки: `.git` → симлинк на `/tmp/sing-box-git`. После перезагрузки: git-история пуста (tmpfs очищена), `config.json` сохранён на NAND. История конфигов с секретами не извлекается при изъятии устройства. |
+| **T35** | **v4.4: MSS Clamping для туннеля** | `nft list chain inet fw4 crne_mss_clamp` и проверить `tcpdump -i tun0 -n 'tcp[tcpflags] & tcp-syn != 0'` при скачивании большого файла | Chain `crne_mss_clamp` существует с правилом `oifname "tun0" ... maxseg size set rt mtu`. TCP SYN через tun0 содержит MSS ≤ 1360 (MTU 1400 − 40 IP − 20 TCP). Зависаний больших загрузок через туннель нет. |
+| **T36** | **v4.4 (ADR-09 hotfix): Окно Captive Portal в Output Kill Switch** | В travel-профиле подключиться к Wi-Fi с Captive Portal: до авторизации выполнить с роутера `nslookup captive.apple.com <WAN_DNS>` и `nft list set inet fw4 crne_cp_output_wan`; после успешной авторизации повторить `nft list set inet fw4 crne_cp_output_wan` | До авторизации: `nslookup` возвращает IP (не блокирован), набор `crne_cp_output_wan` содержит WAN L3-устройство (`phy0-sta0` и т.п.) с `expires 3m`. После `connected` или истечения 180 с: набор пуст, Output Kill Switch снова блокирует весь router-originated WAN-трафик кроме whitelist (NTP/DHCP/DoH). |
 
 ---
 
@@ -1270,7 +1406,7 @@ ssh root@10.10.1.1 "jq -r '.experimental.clash_api.secret' /etc/sing-box/config.
 
 * **Модель доверия к коммерческим подпискам:** поскольку выходные прокси-серверы управляются сторонним поставщиком, они рассматриваются как **недоверенная транзитная среда**. Конфиденциальность передаваемых данных обеспечивается исключительно сквозным шифрованием прикладного уровня (**HTTPS / TLS 1.2+**) между клиентским приложением и целевым веб-ресурсом. Доступ к российским финансовым и государственным сервисам осуществляется напрямую (`Direct`) в обход сторонних прокси-узлов.
 
-* **Защита персональных данных:** система не осуществляет сбор, хранение и обработку персональных данных пользователей. Все логи хранятся исключительно в оперативной памяти (tmpfs) и уничтожаются при перезагрузке устройства. Кэш DNS (`/tmp/sing-box-cache.db`) содержит только соответствия доменных имён и IP-адресов для ускорения резолвинга.
+* **Защита персональных данных и Data Minimization (ADR-10, v4.4):** система не осуществляет сбор, хранение и обработку персональных данных пользователей. Все логи хранятся исключительно в оперативной памяти (tmpfs) и уничтожаются при перезагрузке устройства. Кэш DNS (`/tmp/sing-box-cache.db`) содержит только соответствия доменных имён и IP-адресов для ускорения резолвинга. **Локальный git-репозиторий конфигов также перенесён в tmpfs** (`/tmp/sing-box-git`): история версий `config.json` (адреса серверов, UUID, параметры Reality, секрет Clash API) хранится только в ОЗУ и безвозвратно уничтожается при перезагрузке/отключении питания. Это устраняет риск раскрытия инфраструктуры обхода при физическом изъятии или краже устройства — на NAND-flash остаётся только текущий рабочий `config.json`, а откат к прошлым версиям выполняется через `config.json.bak` или внешний backup-сервер.
 
 ---
 
@@ -1462,13 +1598,16 @@ def build_router_config(standard_top: list[dict], lts_nodes: list[dict],
 
     # Нативный типизированный DNS для sing-box 1.12+ (OpenWrt 24.10.5+)
     # v4.2 (R-D4): dns-local-lan (127.0.0.1:5353) для зоны .lan; Canary в dns.rules.
+    # v4.4 (ADR-08): dns-bootstrap заменён на Cloudflare DoH (1.1.1.1:443) — устранён MITM-вектор
+    #                 и зависимость от Яндекс DNS (РФ-юрисдикция). Certificate pinning через server_name.
     dns_block = {
         "servers": [
             {"type": "https", "tag": "dns-proxy-cf", "server": "1.1.1.1", "detour": "GLOBAL-AUTO"},
             {"type": "https", "tag": "dns-direct-ru", "server": "common.dot.dns.yandex.net",
              "domain_resolver": "dns-bootstrap"},
             {"type": "udp", "tag": "dns-local-lan", "server": "127.0.0.1", "server_port": 5353},
-            {"type": "udp", "tag": "dns-bootstrap", "server": "77.88.8.8"}
+            {"type": "https", "tag": "dns-bootstrap", "server": "1.1.1.1", "server_port": 443,
+             "tls": {"enabled": True, "server_name": "cloudflare-dns.com"}}
         ],
         "rules": [
             {"domain": ["use-application-dns.net", "_dns.resolver.arpa"],
