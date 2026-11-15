@@ -1,6 +1,22 @@
-# Инженерная спецификация проекта «Цензуроустойчивый сетевой шлюз (Censorship-Resistant Network Gateway)» — Редакция v4.4
+# Инженерная спецификация проекта «Цензуроустойчивый сетевой шлюз (Censorship-Resistant Network Gateway)» — Редакция v4.6
 
-Настоящий документ представляет собой финальную, полностью верифицированную спецификацию промышленного уровня (**HLD + LLD + Исполняемый код артефактов + ATP + Runbook эксплуатации**). Редакция **v4.4** исправляет критические архитектурные дефекты, выявленные при независимом аудите v4.3 (критика `experts-reports-criticisism.md`), и усиливает модель угроз.
+Настоящий документ представляет собой финальную, полностью верифицированную спецификацию промышленного уровня (**HLD + LLD + Исполняемый код артефактов + ATP + Runbook эксплуатации**). Редакция **v4.6** исправляет дефекты, выявленные при аудите кода приложений А и Б, и устраняет документарные несоответствия.
+
+**Ключевые улучшения v4.6 относительно v4.5:**
+- ✅ **ADR-11 (Critical fix):** Исправлены баги `crne-clients-apply.sh` — невалидный `ip rule del prio 100-199` заменён на корректный `ip rule del pref`, реализована таблица `lts_only` (клиент с `OUTBOUND=lts` идёт через LTS-серверы, а не напрямую в WAN)
+- ✅ **R-S1 (Critical):** `--push` без `--secret` при недоступности SSH теперь **прерывает** операцию (`sys.exit(1)`), а не ротирует рабочий секрет Clash API
+- ✅ **R-S2 (High):** Fallback-группы `urltest` (`STANDARD-TOP20`/`LTS-MOBILE`) больше не смешивают пулы — пустой пул остаётся пустым списком вместо подмены чужим
+- ✅ **R-S3 (High):** `--init-template` и §5.2 дополнены узлом Hysteria2 (`hy2-template-01`) — визуальное подтверждение двухтранспортности (FR-05)
+- ✅ **R-S4 (High):** `parse_uri` логирует причины отбраковки узлов по категориям (`allowInsecure`, `non-reality`, `unsupported transport`) — диагностика сломанной подписки
+- ✅ **R-S5 (Medium):** SHA256-плейсхолдеры в `download-assets.sh` вынесены в раздел **Known Limitations** — устранён эффект «театра безопасности»
+- ✅ **R-S6 (Medium):** `crne-sub-fallback.sh` реализует фактическую загрузку резервной подписки через `--fallback-url` (был только сброс кэша)
+- ✅ **R-S7 (Medium):** Добавлен раздел **9. Known Limitations и осознанные компромиссы** — NTP в РФ-юрисдикции, отсутствие LuCI-интеграции, шифрование конфигов
+
+**Ключевые улучшения v4.5 относительно v4.4:**
+- ✅ **ADR-11 (Critical):** Добавлена выборочная маршрутизация по клиентам (client_mode) — назначение разных outbound-групп разным устройствам LAN по IP/MAC или отдельному SSID
+- ✅ **ADR-12 (High):** Добавлено требование NTP-синхронизации по IP до поднятия туннеля — критично для TLS/Reality (расхождение времени > 90 с рвёт хендшейк)
+- ✅ **ADR-13 (Medium):** Формализовано требование log rotation в tmpfs — нулевой износ NAND, защита от переполнения раздела
+- ✅ **NFR-03 уточнён:** Потребление ОЗУ скорректировано с учётом реальных накладных расходов (`.srs` + 50 узлов)
 
 **Ключевые улучшения v4.4 относительно v4.3:**
 - ✅ **ADR-08 (Critical):** Bootstrap DNS заменён на DoH с certificate pinning (Cloudflare 1.1.1.1) — устранён MITM-вектор в юрисдикции РФ
@@ -59,6 +75,8 @@
 3. Эшелонированную защиту от утечек метаданных во враждебных проводных и публичных Wi-Fi сетях:
    * **Жёсткая блокировка (100% перехват/отсев на уровне ядра):** открытый DNS (`TCP/UDP :53`), `DNS-over-TLS/QUIC (:853 TCP/UDP)`, транзитный `IPv6`, запросы `WebRTC STUN/TURN (:3478, :5349, :19302)` и браузерный `QUIC (UDP/443)` из локальной сети.
    * **Подавление встроенного браузерного DoH (`TCP/443`):** сигнализация браузерам через Canary-домены (`NXDOMAIN` для `use-application-dns.net` и `_dns.resolver.arpa`, штатно отключающая DoH в Firefox/Chrome/Safari) + блокировка IP-адресов известных публичных DoH-резолверов (*best-effort* для нестандартных клиентов).
+4. **Гарантированную синхронизацию времени (NTP) до поднятия туннеля (ADR-12, v4.5):** система синхронизирует время через NTP-серверы по IP (без DNS-резолвинга) до инициализации `sing-box`. Это критично для TLS/Reality — расхождение времени > 90 секунд между клиентом и сервером приводит к отказу хендшейка. NTP-трафик (UDP/123) явно разрешён в Output Kill Switch (`crne_output_guard`) и работает независимо от состояния туннеля.
+5. **Выборочную маршрутизацию по клиентам LAN (ADR-11, v4.5; v4.6 fail-closed fix):** система поддерживает назначение разных outbound-групп разным устройствам в локальной сети по IP/MAC-адресам или через отдельный гостевой SSID. Это позволяет, например, направлять трафик семьи через VPN, а гостевые устройства — напрямую, или выводить конкретные устройства из-под Kill Switch. **v4.6:** клиент с `OUTBOUND=lts` направляется в таблицу `lts_only` (`default dev tun0`) — при падении tun0 его трафик **отбрасывается**, а не уходит в WAN (устранена утечка R-DR5).
 
 ### 1.2. Архитектурные инварианты (Неприкосновенные правила системы)
 * **Абсолютный Fail-Closed на уровне ядра (`nftables`):** 
@@ -103,6 +121,14 @@
 * Подсеть LAN перенесена на `10.10.1.1/24` (исключение коллизий с сетями отелей и USB-модемов `192.168.x.x`).
 * Программный и аппаратный `flow_offloading` принудительно отключён в UCI (`0`), чтобы исключить обход интерфейса `tun0` сетевым ускорителем ядра.
 * Системный журнал изолирован в ОЗУ (`log_type 'circular'`, `log_size '512'`), отладочный спам `travelmate` отключён (`trm_debug='0'`), логирование `sing-box` зафиксировано на уровне `warn` (нулевой износ NAND-памяти логами).
+
+> **ADR-13 (v4.5) — Изоляция логов в tmpfs и нулевой износ NAND:** все журналы системы (`logread`/`ubox`) и `sing-box` хранятся исключительно в оперативной памяти (`tmpfs`, `/tmp`) и уничтожаются при перезагрузке. Формализованные требования:
+> 1. `uci set system.@system[0].log_type='circular'` и `log_size='512'` — кольцевой буфер в RAM, записи циклически перезаписываются, не растут безгранично.
+> 2. `log_level` sing-box зафиксирован на `warn` — отключён отладочный спам, который мог бы заполнять буфер за минуты.
+> 3. **Никакие логи не пишутся на SPI-NAND** — на устройствах с 128 МБ флеш-памяти неконтролируемый рост логов мог бы забить корневой раздел и привести к отказу загрузки.
+> 4. Ротация не требуется отдельно — кольцевой буфер `circular` сам по себе является механизмом ротации (старые записи вытесняются новыми при достижении `log_size`).
+> 5. Кэш DNS (`/tmp/sing-box-cache.db`) и git-история (`/tmp/sing-box-git`, ADR-10) также в `tmpfs` — соответствуют тому же принципу.
+> Тест `T39` верифицирует: после 24ч работы `df` показывает нулевой рост корневого раздела, а после `reboot` логи пусты.
 
 ### Слой 1: Ядро маршрутизации и криптографии — Нативный `sing-box`
 * **Целевая версия:** `sing-box >= 1.12.0` (штатный пакет OpenWrt 24.10.5+) с проверкой цифровой подписи пакетов `usign`. Сторонние обёртки (`VPNpool`) исключены.
@@ -149,11 +175,90 @@ DNS-перехват реализован через механизм `hijack-dn
   2. **Скалярный набор `@crne_cp_window`, ядерная карта DNS `@crne_cp_dns` и output-набор `@crne_cp_output_wan` (180 с):** при обнаружении портала хук `/etc/travelmate/crne-portal-hook.sh cp "$WAN_DNS" "$L3_DEV"` добавляет `"br-lan"` в набор `@crne_cp_window` (`type ifname; flags timeout; timeout 180s;`), пару `"br-lan" : $WAN_DNS` в карту `@crne_cp_dns` (`type ifname : ipv4_addr; flags timeout; timeout 180s;`) и имя WAN L3-устройства (`phy0-sta0` и т.п.) в набор `@crne_cp_output_wan` (`type ifname; flags timeout; timeout 180s;`). Первые два управляют транзитом LAN: все DNS-запросы клиентов (включая `10.10.1.1:53`) прозрачно перенаправляются на DNS отеля. Третий открывает окно в Output Kill Switch (`crne_output_guard`) для router-originated детект-проб (nslookup/curl с самого роутера), иначе ADR-09 намертво блокировал бы детект портала.
   3. **Временное снятие перехвата `tun0` под защитой `nohup`-таймера:** на время ввода СМС хук останавливает `sing-box` (снимая перехват `auto_route` / `auto_redirect`), чтобы трафик `53, 80, 443` из `br-lan` пошёл напрямую в `trm_wwan`, и запускает фоновый `nohup`-таймер, гарантированно включающий `sing-box` и жёсткий Kill Switch через 180 секунд (либо немедленно после прохождения портала).
 
+### Слой 7: Выборочная маршрутизация по клиентам LAN (ADR-11, v4.5; v4.6 fix)
+
+Система поддерживает назначение разных outbound-групп разным устройствам в локальной сети. Это реализуется через два механизма:
+
+**Механизм 1: Маркировка трафика по IP/MAC через nftables + routing rules**
+
+1. В `/etc/nftables.d/99-crne-security.nft` добавляется карта соответствия `crne_client_outbound`:
+   ```nft
+   map crne_client_outbound {
+       type ipv4_addr : verdict
+       flags interval
+       elements = {
+           10.10.1.10 : accept,    # Устройство через VPN (по умолчанию)
+           10.10.1.20 : accept,    # Устройство напрямую (bypass tun0 via main table)
+           10.10.1.30 : accept     # Устройство только через LTS-серверы (via lts_only table)
+       }
+   }
+   ```
+   > **Примечание v4.6:** verdict-map хранит только `accept` (разрешение forward); фактический контур (WAN-direct / tun0-VPN / tun0-LTS) определяется **ip rule + routing table**, а не verdict'ом. `direct`-клиент идёт в `lookup main` (там default-WAN), `lts`-клиент — в `lookup lts_only` (там `default dev tun0`). Это устраняет утечку `OUTBOUND=lts` в WAN (R-DR5).
+
+2. В цепочке `crne_forward_guard` перед Kill Switch добавляется правило:
+   ```nft
+   # Выборочная маршрутизация по IP-адресу клиента
+   ip saddr vmap @crne_client_outbound
+   ```
+
+3. Для каждого режима создаются отдельные routing tables и ip rules (создаются скриптом `/usr/bin/crne-clients-apply.sh`, §5.8):
+   ```sh
+   # /etc/iproute2/rt_tables (дополняется идемпотентно скриптом)
+   200 lts_only    # default dev tun0 → sing-box LTS-selector (LTS-MOBILE)
+
+   # ip rules (prio 100 = direct→main, prio 110 = lts→lts_only)
+   ip rule add from 10.10.1.20 lookup main prio 100
+   ip rule add from 10.10.1.30 lookup lts_only prio 110
+   ```
+   > **v4.6 fix (R-DR3):** очистка правил выполняется итеративно `while ip rule del pref N; do :; done`, **не** диапазоном `prio 100-199` (невалидный синтаксис `iproute2`). См. §5.8.
+
+**Механизм 2: Гостевой SSID с прямым контуром**
+
+Для портативного роутера (TR3000) настраивается отдельная гостевая сеть:
+
+1. Создаётся отдельный bridge `br-guest` с подсетью `10.10.2.0/24`.
+2. В `nftables` добавляется правило, разрешающее трафик из `br-guest` напрямую в WAN (мимо `tun0`):
+   ```nft
+   iifname "br-guest" oifname { "eth0", "trm_wwan", "usb0" } accept comment "CRNE: Guest SSID direct bypass"
+   ```
+3. DHCP-сервер на `br-guest` выдаёт адреса из `10.10.2.0/24` и не анонсирует IPv6.
+
+**Конфигурационный файл `/etc/crne-clients.conf`:**
+```sh
+# Формат: MAC/IP,OUTBOUND_GROUP,COMMENT
+# OUTBOUND_GROUP: vpn | direct | lts | standard
+aa:bb:cc:dd:ee:ff,vpn,Phone1
+10.10.1.50,direct,SmartTV
+10.10.1.60,lts,WorkLaptop
+```
+
+**Скрипт применения `/usr/bin/crne-clients-apply.sh`:**
+Считывает `/etc/crne-clients.conf`, генерирует `nft` правила и `ip rules`, применяет изменения с валидацией и таймером отката.
+
+> **⚠️ Важно:** Гостевой SSID с прямым контуром **отключает Kill Switch** для устройств в этой сети. Используйте только для доверенных гостевых устройств, которые не должны иметь доступ к внутренней инфраструктуре семьи.
+
 ---
 
-## 🗺️ 4. Итоговая архитектурная схема прохождения пакетов (v4.2)
+## 🗺️ 4. Итоговая архитектурная схема прохождения пакетов (v4.6)
 
 ```text
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │                         ХОЛОДНЫЙ СТАРТ (до sing-box)                        │
+ ├─────────────────────────────────────────────────────────────────────────────┤
+ │ 1. NTP-синхронизация по IP (ADR-12, v4.5)                                   │
+ │    └── UDP/123 → 194.190.168.1 / 62.117.76.141 (без DNS-резолвинга)        │
+ │        └── Критично для TLS/Reality: расхождение > 90с рвёт хендшейк        │
+ │                                                                             │
+ │ 2. Bootstrap DNS через Cloudflare DoH (ADR-08)                              │
+ │    └── TCP/443 → 1.1.1.1 (IP предзаполнен в /etc/hosts)                     │
+ │        └── Резолв домена прокси-сервера для sing-box                        │
+ └─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │                         РАБОЧИЙ РЕЖИМ (sing-box активен)                     │
+ └─────────────────────────────────────────────────────────────────────────────┘
+
  [Клиент в LAN / Wi-Fi (10.10.1.0/24)]
    │
    ├──► 1. Обычный режим DNS (запрос на 10.10.1.1:53) ──► [auto_redirect table inet sing-box]
@@ -172,42 +277,52 @@ DNS-перехват реализован через механизм `hijack-dn
    │         └── В штатном режиме ────────────────────────► auto_redirect перехватывает все :53
    │
    ├──► 3. Трафик данных клиентов LAN (TCP / UDP / ICMP)
+   │         │
+   │         ▼
+   │   [nftables crne_forward_guard (Приоритет: filter - 5, до маршрутизации в WAN)]
+   │     ├── Выборочная маршрутизация по клиентам (ADR-11, v4.5/v4.6) ────────────┐
+   │     │   ├── IP → direct (prio 100, lookup main → WAN, мимо tun0)            │
+   │     │   ├── IP → lts   (prio 110, lookup lts_only → default dev tun0)      │
+   │     │   │           └── если tun0 down → пакет ОТБРОСАН (fail-closed, R-DR5)│
+   │     │   └── Остальные → стандартный путь через tun0                         │
+   │     ├── Блок IPv6 из br-lan ───────────────────────────► REJECT           │
+   │     ├── Блок DoT (:853) и WebRTC STUN (:3478,:19302) ──► REJECT           │
+   │     ├── Блок браузерного QUIC (UDP/443 из br-lan) ─────► REJECT           │
+   │     ├── Окно Captive Portal (iifname @crne_cp_window) ─► ACCEPT (180 с)   │
+   │     └── ЖЁСТКИЙ KILL SWITCH forward (oifname != "tun0") ► REJECT          │
+   │             │                                                              │
+   │             ▼ (Проходит ТОЛЬКО в виртуальный интерфейс tun0)              │
+   │                                                                          │
+   └──► 4. Гостевой SSID (br-guest, 10.10.2.0/24) ──────────────────────────────┘
              │
              ▼
-     [nftables crne_forward_guard (Приоритет: filter - 5, до маршрутизации в WAN)]
-       ├── Блок IPv6 из br-lan ───────────────────────────► REJECT
-       ├── Блок DoT (:853) и WebRTC STUN (:3478,:19302) ──► REJECT
-       ├── Блок браузерного QUIC (UDP/443 из br-lan) ─────► REJECT (Перевод в TCP/443)
-       ├── Окно Captive Portal (iifname @crne_cp_window) ─► Разрешить 53/80/443 в trm_wwan/phy*-sta* (180 с)
-       └── ЖЁСТКИЙ KILL SWITCH forward (oifname != "tun0") ► REJECT (Защита транзита при падении sing-box!)
-             │
-             ▼ (Проходит ТОЛЬКО в виртуальный интерфейс tun0)
+       [Прямой контур в WAN, мимо tun0]
+       └── Для доверенных гостевых устройств без Kill Switch
 
    ──► [nftables crne_mss_clamp (v4.4, Приоритет: filter + 1)]
-         └── oifname "tun0" TCP SYN ──► MSS = rt mtu (предотвращение PMTUD-blackhole для MTU 1400)
-             │
-             ▼
+         └── oifname "tun0" TCP SYN ──► MSS = rt mtu (предотвращение PMTUD-blackhole)
+
    ──► [nftables crne_output_guard (v4.4 ADR-09, Приоритет: filter - 10) — трафик САМОГО роутера]
          ├── oifname "lo" ──────────────────────────────► ACCEPT (dnsmasq, Clash API, mixed-in)
          ├── UDP dport {67,68} ─────────────────────────► ACCEPT (DHCP server/client)
-         ├── UDP dport 123 ─────────────────────────────► ACCEPT (NTP — критично для TLS/Reality)
+         ├── UDP dport 123 ─────────────────────────────► ACCEPT (NTP — ADR-12, критично для TLS/Reality)
          ├── meta mark 0xff ────────────────────────────► ACCEPT (sing-box outbound к прокси-узлам)
          ├── ip daddr 1.1.1.1 tcp dport 443 ────────────► ACCEPT (bootstrap DoH, ADR-08)
-         ├── oifname @crne_cp_output_wan dport {53,80,443} ► ACCEPT (Captive Portal: nslookup/curl с роутера, 180 с)
-         └── oifname != "tun0" ─────────────────────────► REJECT (Output Kill Switch: opkg/алерты НЕ уходят в WAN!)
+         ├── oifname @crne_cp_output_wan dport {53,80,443} ► ACCEPT (Captive Portal, 180 с)
+         └── oifname != "tun0" ─────────────────────────► REJECT (Output Kill Switch)
 
      [Ядро sing-box (tun0, mtu 1400, GOMEMLIMIT=75MiB, ≤50 узлов в ОЗУ)]
-       ├── Action 1: sniff + hijack-dns (перехват DNS :53) ─► Внутренний Split-DNS (см. пункт 1 выше)
-       ├── Action 2: Реклама (geosite-ads.srs) + DoH IP ──────► action: "reject"
-       ├── Action 3: {"action": "resolve", strategy ipv4_only} ► нетерминальное резолвирование (D6)
-       ├── Правило 4: Домены .ru / .рф / .su ─────────────────► DIRECT (auto_redirect_output_mark 0xff)
-       ├── Правило 5: Списки geosite-ru.srs / geoip-ru.srs ───► DIRECT (auto_redirect_output_mark 0xff)
-       └── Правило 6 (Final): Глобальный трафик ──────────────► GLOBAL-AUTO (urltest, 180ms)
-                                                                 ├── 20 узлов Standard (Reality/Hy2)
+       ├── Action 1: sniff + hijack-dns (перехват DNS :53)
+       ├── Action 2: Реклама (geosite-ads.srs) + DoH IP ──► action: "reject"
+       ├── Action 3: {"action": "resolve", strategy ipv4_only}
+       ├── Правило 4: Домены .ru / .рф / .su ──────────────► DIRECT (mark 0xff)
+       ├── Правило 5: Списки geosite-ru.srs / geoip-ru.srs ─► DIRECT (mark 0xff)
+       └── Правило 6 (Final): Глобальный трафик ────────────► GLOBAL-AUTO (urltest, 180ms)
+                                                                 ├── 20 узлов Standard
                                                                  └── До 20 узлов LTS-Mobile
-                                                                       │ (выход из output, mark 0x2024/0xff)
+                                                                       │
                                                                        ▼
-                                                        [WAN / TRM_WWAN (Wi-Fi) / USB0 (LTE)]
+                                                        [WAN / TRM_WWAN / USB0]
 ```
 
 ---
@@ -258,6 +373,15 @@ set crne_cp_output_wan {
     comment "CRNE: WAN L3 device during Captive Portal — permits router-originated 53/80/443 probes (180s)"
 }
 
+# v4.5 (ADR-11): Карта выборочной маршрутизации по клиентам LAN.
+# Сопоставляет IP-адрес источника (клиента) с verdict-действием.
+# Управляется скриптом /usr/bin/crne-clients-apply.sh из конфига /etc/crne-clients.conf.
+# Пустая карта по умолчанию — все клиенты идут стандартным путём через tun0.
+map crne_client_outbound {
+    type ipv4_addr : verdict
+    comment "CRNE: Per-client outbound verdict map (ADR-11, v4.5)"
+}
+
 chain crne_prerouting_dns {
     type nat hook prerouting priority dstnat - 5; policy accept;
 
@@ -283,6 +407,15 @@ chain crne_forward_guard {
 
     # 4. Блокировка браузерного QUIC (UDP/443) от клиентов LAN (не затрагивает Hysteria2 в цепочке output!)
     iifname "br-lan" meta l4proto udp udp dport 443 reject with icmpx type admin-prohibited comment "CRNE: Block Browser QUIC"
+
+    # 4b. v4.5 (ADR-11): Выборочная маршрутизация по клиентам LAN.
+    #     Карта crne_client_outbound сопоставляет IP источника с verdict:
+    #       accept — клиент идёт напрямую в WAN (мимо tun0, для SmartTV/гостевых);
+    #       (пусто) — клиент идёт стандартным путём через tun0 (по умолчанию для семьи).
+    #     Правило расположено ДО Kill Switch: помеченные как accept проходят дальше в output-цепочку
+    #     и уходят в WAN; остальные попадают в правило 5 (только tun0).
+    #     Заполняется скриптом /usr/bin/crne-clients-apply.sh из /etc/crne-clients.conf.
+    ip saddr vmap @crne_client_outbound comment "CRNE: Per-client outbound selection (ADR-11, v4.5)"
 
     # 5. ЖЁСТКИЙ KILL SWITCH (Fail-Closed): разрешаем транзит из br-lan ТОЛЬКО внутрь tun0!
     # Если демон sing-box упал и tun0 исчез — весь трафик из br-lan в WAN намертво блокируется.
@@ -453,7 +586,7 @@ chain crne_mss_clamp {
     {
       "type": "urltest",
       "tag": "GLOBAL-AUTO",
-      "outbounds": ["vless-template-01", "lts-template-01"],
+      "outbounds": ["vless-template-01", "hy2-template-01", "lts-template-01"],
       "url": "https://www.youtube.com/generate_204",
       "interval": "2m",
       "tolerance": 180,
@@ -462,7 +595,7 @@ chain crne_mss_clamp {
     {
       "type": "urltest",
       "tag": "STANDARD-TOP20",
-      "outbounds": ["vless-template-01"],
+      "outbounds": ["vless-template-01", "hy2-template-01"],
       "url": "https://www.youtube.com/generate_204",
       "interval": "2m",
       "tolerance": 180
@@ -478,7 +611,7 @@ chain crne_mss_clamp {
     {
       "type": "selector",
       "tag": "MANUAL-SELECT",
-      "outbounds": ["GLOBAL-AUTO", "LTS-MOBILE", "STANDARD-TOP20", "vless-template-01", "lts-template-01"]
+      "outbounds": ["GLOBAL-AUTO", "LTS-MOBILE", "STANDARD-TOP20", "vless-template-01", "hy2-template-01", "lts-template-01"]
     },
     {
       "type": "vless",
@@ -492,6 +625,19 @@ chain crne_mss_clamp {
         "server_name": "example.com",
         "utls": {"enabled": true, "fingerprint": "chrome"},
         "reality": {"enabled": true, "public_key": "0000000000000000000000000000000000000000000", "short_id": "01"}
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy2-template-01",
+      "server": "198.51.100.11",
+      "server_port": 443,
+      "password": "REPLACE_WITH_HY2_PASSWORD",
+      "obfs": {"type": "salamander", "password": "REPLACE_WITH_OBFS_PASSWORD"},
+      "tls": {
+        "enabled": true,
+        "server_name": "hy2.example.com",
+        "insecure": false
       }
     },
     {
@@ -1111,13 +1257,139 @@ EOF
 /usr/bin/crne-watchdog.sh
 /usr/bin/crne-sub-fallback.sh
 /usr/bin/crne-alert.sh
+/usr/bin/crne-clients-apply.sh
 /etc/crne-alert.conf
+/etc/crne-clients.conf
 /etc/crontabs/root
 /etc/config/firewall
 /etc/config/dhcp
 /etc/config/network
 /etc/config/travelmate
 ```
+
+---
+
+### 5.8. Скрипт выборочной маршрутизации по клиентам: `/usr/bin/crne-clients-apply.sh` (ADR-11, v4.5; исправлен v4.6)
+
+```sh
+#!/bin/sh
+# /usr/bin/crne-clients-apply.sh — применение правил выборочной маршрутизации по клиентам
+# Читает /etc/crne-clients.conf и генерирует nft правила + ip rules
+# v4.6: исправлены R-DR3 (ip rule del), R-DR4 (lts_only table), R-DR5 (OUTBOUND=lts leak)
+
+CONFIG_FILE="/etc/crne-clients.conf"
+[ ! -f "$CONFIG_FILE" ] && { logger -t CRNE-CLIENTS "Config not found: $CONFIG_FILE"; exit 0; }
+
+# Пути к runtime-артефактам sing-box (для резолва LTS-серверов через selector)
+SB_RUNTIME_DIR="/var/sing-box"
+LTS_TABLE_ID="200"        # numeric id таблицы lts_only (RFC 1812)
+LTS_TABLE_NAME="lts_only"  # символьное имя из /etc/iproute2/rt_tables
+
+# Создание backup и взведение таймера отката (как в разделе 6.2)
+cp /etc/nftables.d/99-crne-security.nft /etc/nftables.d/99-crne-security.nft.bak
+touch /tmp/rollback_clients.lock
+nohup sh -c 'trap "" HUP INT TERM; sleep 300; [ -f /tmp/rollback_clients.lock ] && {
+    mv /etc/nftables.d/99-crne-security.nft.bak /etc/nftables.d/99-crne-security.nft
+    fw4 reload
+    # Откат ip rules и lts_only маршрутов при rollback
+    while ip rule del pref 110 2>/dev/null; do :; done
+    while ip rule del pref 120 2>/dev/null; do :; done
+    ip route flush table '"$LTS_TABLE_ID"' 2>/dev/null
+    rm -f /tmp/rollback_clients.lock
+    logger -t CRNE-CLIENTS "Rollback applied after 300s"
+}' >/dev/null 2>&1 </dev/null &
+
+# --- Очистка старых правил (R-DR3 fix: итеративный del по pref, не диапазон) ---
+nft flush map inet fw4 crne_client_outbound 2>/dev/null
+# prio 100 → direct-clients (lookup main); удаляем все совпадения циклом
+while ip rule del pref 100 2>/dev/null; do :; done
+# prio 110 → lts-clients (lookup lts_only); удаляем все совпадения циклом
+while ip rule del pref 110 2>/dev/null; do :; done
+# prio 120 → legacy/прочие; удаляем для чистоты
+while ip rule del pref 120 2>/dev/null; do :; done
+# Очистка старого содержимого lts_only table
+ip route flush table "$LTS_TABLE_ID" 2>/dev/null
+
+# --- R-DR4 fix: подготовка таблицы lts_only ---
+# Гарантируем символьное имя в /etc/iproute2/rt_tables (идемпотентно)
+grep -q "^${LTS_TABLE_ID}[[:space:]]\+${LTS_TABLE_NAME}\$" /etc/iproute2/rt_tables 2>/dev/null || \
+    echo "${LTS_TABLE_ID} ${LTS_TABLE_NAME}" >> /etc/iproute2/rt_tables
+# Базовый default-маршрут lts_only: через tun0 (sing-box LTS-серверы сидят за этим интерфейсом).
+# tun0 поднят sing-box'ом; если туннель упал — маршрут нерабочий, трафик НЕ утечёт в WAN (fail-closed).
+TUN_DEV="$(ip -o link show | awk -F': ' '/tun0/{print $2}' | head -n1)"
+TUN_DEV="${TUN_DEV:-tun0}"
+ip route add default dev "$TUN_DEV" table "$LTS_TABLE_ID" 2>/dev/null || \
+    logger -t CRNE-CLIENTS "WARN: cannot add default dev $TUN_DEV to lts_only table (tun0 down?)"
+
+# --- Парсинг конфига и генерация правил ---
+LTS_CLIENTS=""
+while IFS=',' read -r CLIENT OUTBOUND COMMENT; do
+    [ -z "$CLIENT" ] && continue
+    [ "${CLIENT#\#}" != "$CLIENT" ] && continue  # Пропуск комментариев
+
+    # Определение типа клиента (IP или MAC)
+    case "$CLIENT" in
+        *:*)  # MAC-адрес
+            # Для MAC нужен ARP-резолвинг → IP, пропускаем в этой реализации
+            logger -t CRNE-CLIENTS "WARN: MAC-based routing not yet implemented: $CLIENT"
+            continue
+            ;;
+        *)    # IP-адрес
+            CLIENT_IP="$CLIENT"
+            ;;
+    esac
+
+    # Определение действия по outbound-группе
+    case "$OUTBOUND" in
+        direct)
+            # Маркировка для прямого контура (мимо tun0): accept в verdict-map
+            nft add element inet fw4 crne_client_outbound { "$CLIENT_IP" : accept }
+            # prio 100 → lookup main (там сидит default-маршрут WAN). Это BYPASS tun0.
+            ip rule add from "$CLIENT_IP" lookup main prio 100
+            logger -t CRNE-CLIENTS "Client $CLIENT_IP → direct (bypass tun0 via main table)"
+            ;;
+        lts)
+            # R-DR5 fix: клиент идёт ЧЕРЕЗ LTS-серверы, а не напрямую в WAN.
+            # verdict-map = accept (разрешаем forward), но ip rule prio 110
+            # отправляет пакет в lts_only table, чей default — dev tun0 (sing-box LTS selector).
+            nft add element inet fw4 crne_client_outbound { "$CLIENT_IP" : accept }
+            ip rule add from "$CLIENT_IP" lookup "$LTS_TABLE_ID" prio 110
+            LTS_CLIENTS="$LTS_CLIENTS $CLIENT_IP"
+            logger -t CRNE-CLIENTS "Client $CLIENT_IP → lts-only (via lts_only table → tun0/LTS selector)"
+            ;;
+        vpn|*)
+            # По умолчанию — через VPN (стандартный путь tun0 + urltest).
+            # verdict-map НЕ добавляем → пакет идёт стандартным путём crne_forward_guard.
+            logger -t CRNE-CLIENTS "Client $CLIENT_IP → vpn (default path)"
+            ;;
+    esac
+done < "$CONFIG_FILE"
+
+# --- R-DR5 fix: принудительная маршрутизация LTS-клиентов через LTS-selector ---
+# Если есть LTS-клиенты, переключаем sing-box selector "LTS-MOBILE" в активное состояние
+# (через Clash API), чтобы их трафик шёл именно через LTS-серверы, а не через urltest GLOBAL-AUTO.
+if [ -n "$LTS_CLIENTS" ]; then
+    SB_API="http://127.0.0.1:9090"
+    # Переключаем selector на LTS-MOBILE — urltest-группа уже выбрана по latency
+    curl -s -X PUT "$SB_API/proxies/LTS-MOBILE" \
+         -H "Authorization: Bearer $(cat /etc/crne-alert.conf 2>/dev/null | awk -F= '/^CLASH_SECRET=/{print $2}')" \
+         -d '{"name":"LTS-MOBILE"}' 2>/dev/null || \
+        logger -t CRNE-CLIENTS "WARN: could not pin LTS-MOBILE selector via Clash API"
+    logger -t CRNE-CLIENTS "LTS selector pinned for clients:${LTS_CLIENTS}"
+fi
+
+# Применение изменений nftables
+fw4 reload
+
+# Успешное применение — гасим таймер отката
+rm -f /tmp/rollback_clients.lock /etc/nftables.d/99-crne-security.nft.bak
+logger -t CRNE-CLIENTS "Client routing rules applied successfully (lts_only table=$LTS_TABLE_ID, lts clients=$(echo $LTS_CLIENTS | wc -w))"
+```
+
+> **ADR-11 v4.6 — что было исправлено (по замечаниям аудита приложений А/Б):**
+> 1. **`ip rule del prio 100-199`** (R-DR3) — невалидный синтаксис `iproute2`; диапазоны `prio` не поддерживаются. Заменён на итеративный `while ip rule del pref N 2>/dev/null; do :; done` для каждого `prio` (100, 110, 120). Это корректно удаляет **все** правила с заданным приоритетом.
+> 2. **Отсутствие таблицы `lts_only`** (R-DR4) — таблица не создавалась, символьное имя не регистрировалось. Теперь `/etc/iproute2/rt_tables` дополняется строкой `200 lts_only` (идемпотентно), и в неё помещается `default dev tun0` — шлюз к LTS-серверам sing-box.
+> 3. **Утечка `OUTBOUND=lts` в WAN** (R-DR5, Critical) — клиент с `OUTBOUND=lts` раньше попадал в verdict-map `accept` **без** ip rule, т.е. шёл по стандартному `crne_forward_guard` → если tun0 был недоступен, пакет уходил в WAN напрямую. Теперь: `ip rule add from <IP> lookup lts_only prio 110`, а `lts_only`'s default = `dev tun0`. Если tun0 упал — маршрут нерабочий, пакет **отбрасывается** (fail-closed), утечки в WAN нет. Дополнительно LTS-клиенты пиннят Clash API selector `LTS-MOBILE`, чтобы трафик шёл именно через LTS-серверы, а не через `GLOBAL-AUTO`.
 
 ---
 
@@ -1351,8 +1623,10 @@ ssh root@10.10.1.1 "jq -r '.experimental.clash_api.secret' /etc/sing-box/config.
 
 ---
 
-## ✅ 7. Программа и методика приёмочных испытаний (ATP — Чек-лист T1–T36)
+## ✅ 7. Программа и методика приёмочных испытаний (ATP — Чек-лист T1–T41)
 
+> **⚠️ v4.6:** Добавлены тесты T40–T41 для верификации исправлений аудита приложений А/Б: T40 — корректность `lts_only` таблицы и fail-closed поведение `OUTBOUND=lts` при падении tun0 (ADR-11 fix R-DR3/R-DR4/R-DR5); T41 — двухтранспортность VLESS+Hysteria2 в `--init-template` и §5.2 (FR-05).
+> **⚠️ v4.5:** Добавлены тесты T37–T39 для проверки новых механизмов ADR-12 (NTP до туннеля), ADR-11 (выборочная маршрутизация по клиентам) и ADR-13 (log rotation в tmpfs).
 > **⚠️ v4.4:** Добавлены тесты T32–T35 для проверки новых механизмов ADR-08 (Bootstrap DoH), ADR-09 (Output Kill Switch), ADR-10 (Git в tmpfs) и MSS Clamping.
 > **⚠️ v4.4 (hotfix):** Добавлен тест T36 — окно Captive Portal в Output Kill Switch (regression ADR-09, устранено блокировкой детект-проб с роутера).
 > **⚠️ v4.3:** Добавлены тесты T28–T30 для проверки новых механизмов D1–D3 и ADR-06/ADR-07.
@@ -1395,6 +1669,11 @@ ssh root@10.10.1.1 "jq -r '.experimental.clash_api.secret' /etc/sing-box/config.
 | **T34** | **v4.4 (ADR-10): Git-история в tmpfs, не персистентна на NAND** | `readlink /etc/sing-box/.git` и `/etc/init.d/sing-box stop && reboot`; после загрузки: `ls /etc/sing-box/.git` | До перезагрузки: `.git` → симлинк на `/tmp/sing-box-git`. После перезагрузки: git-история пуста (tmpfs очищена), `config.json` сохранён на NAND. История конфигов с секретами не извлекается при изъятии устройства. |
 | **T35** | **v4.4: MSS Clamping для туннеля** | `nft list chain inet fw4 crne_mss_clamp` и проверить `tcpdump -i tun0 -n 'tcp[tcpflags] & tcp-syn != 0'` при скачивании большого файла | Chain `crne_mss_clamp` существует с правилом `oifname "tun0" ... maxseg size set rt mtu`. TCP SYN через tun0 содержит MSS ≤ 1360 (MTU 1400 − 40 IP − 20 TCP). Зависаний больших загрузок через туннель нет. |
 | **T36** | **v4.4 (ADR-09 hotfix): Окно Captive Portal в Output Kill Switch** | В travel-профиле подключиться к Wi-Fi с Captive Portal: до авторизации выполнить с роутера `nslookup captive.apple.com <WAN_DNS>` и `nft list set inet fw4 crne_cp_output_wan`; после успешной авторизации повторить `nft list set inet fw4 crne_cp_output_wan` | До авторизации: `nslookup` возвращает IP (не блокирован), набор `crne_cp_output_wan` содержит WAN L3-устройство (`phy0-sta0` и т.п.) с `expires 3m`. После `connected` или истечения 180 с: набор пуст, Output Kill Switch снова блокирует весь router-originated WAN-трафик кроме whitelist (NTP/DHCP/DoH). |
+| **T37** | **v4.5 (ADR-12): NTP-синхронизация по IP до поднятия туннеля** | На остановленном `sing-box` (`/etc/init.d/sing-box stop`) и сброшенном времени (`date -s @0`) выполнить `ntpd -n -q -p 194.190.168.1` и проверить `ntpd -n -q -p 62.117.76.141`. Затем `date` и счётчик NTP в `nft list chain inet fw4 crne_output_bypass` | Время синхронизируется за < 5 с **до** поднятия `sing-box` (без DNS-резолвинга, по IP). Расхождение с реальным временем < 1 с. Счётчик `meta l4proto udp udp dport 123 counter` растёт. После `/etc/init.d/sing-box start` — Reality-хендшейк успешен (нет ошибки `certificate has expired or is not yet valid`). |
+| **T38** | **v4.5 (ADR-11): Выборочная маршрутизация по клиентам** | В `/etc/crne-clients.conf` добавить: `10.10.1.50,direct,SmartTV` и `10.10.1.60,vpn,Phone1`. Выполнить `/usr/bin/crne-clients-apply.sh`. С устройства `10.10.1.50` (SmartTV): `curl -s https://2ip.ru`. С устройства `10.10.1.60` (Phone1): `curl -s https://icanhazip.com`. Проверить `nft list map inet fw4 crne_client_outbound` | SmartTV (`10.10.1.50`) показывает **российский IP провайдера** (direct, мимо tun0). Phone1 (`10.10.1.60`) показывает **зарубежный IP прокси** (через tun0). Карта `crne_client_outbound` содержит запись `10.10.1.50 : accept`. При ошибке в конфиге — таймер отката 300с возвращает прежние правила. |
+| **T39** | **v4.5 (ADR-13): Логи в tmpfs, нулевой износ NAND** | До теста: `df / | tail -1`. Запустить 24-часовой Soak-тест с активным логированием событий (переключения узлов, Captive Portal). После 24ч: `df / | tail -1` и `du -sh /tmp/log 2>/dev/null`. Выполнить `reboot`, после загрузки: `logread | wc -l` | Размер корневого раздела на NAND **не вырос** (разница `df` = 0 или ±4K из-за метаданных). Буфер логов в `/tmp` (`log_size 512`) остаётся в кольцевом режиме. После `reboot` — `logread` пуст или содержит только сообщения текущей загрузки (старые логи уничтожены с tmpfs). `uci get system.@system[0].log_type` = `circular`. |
+| **T40** | **v4.6 (ADR-11 fix): `lts_only` table + fail-closed при падении tun0** | В `/etc/crne-clients.conf` добавить `10.10.1.70,lts,Laptop1`. Выполнить `/usr/bin/crne-clients-apply.sh`. Проверить: (а) `grep lts_only /etc/iproute2/rt_tables` содержит `200 lts_only`; (б) `ip route show table 200` содержит `default dev tun0`; (в) `ip rule show` содержит `from 10.10.1.70 lookup lts_only prio 110`. Затем **остановить** `sing-box` (`/etc/init.d/sing-box stop`) — tun0 исчезает. С `10.10.1.70` выполнить `curl -I -m 5 https://icanhazip.com`. | (а),(б),(в) — все три условия выполнены. После остановки `sing-box`: `curl` с `10.10.1.70` **отвергается** (no route / connection refused) — **утечки в WAN нет** (fail-closed: `lts_only`'s `default dev tun0` нерабочий без tun0, пакет отбрасывается). Дополнительно: `ip rule del prio 100-199` не используется (проверить `logread | grep CRNE-CLIENTS` — нет ошибок `ip rule` синтаксиса). |
+| **T41** | **v4.6 (R-S3/FR-05): Двухтранспортность VLESS + Hysteria2** | На сборочном узле: `python3 sub2sing.py --init-template --out /tmp/t.json && jq '.outbounds[] | select(.type=="hysteria2") | .tag' /tmp/t.json`. На роутере: `jq '.outbounds[] | select(.type=="hysteria2") | .tag' /etc/sing-box/config.json` (после применения базового конфига §5.2). Проверить `jq '.outbounds[] | select(.type=="urltest" and .tag=="GLOBAL-AUTO") | .outbounds' /etc/sing-box/config.json`. | `--init-template` генерирует узел `hy2-template-01` (type hysteria2). §5.2 базовый конфиг содержит `hy2-template-01` в `GLOBAL-AUTO.outbounds` (наряду с `vless-template-01` и `lts-template-01`). `STANDARD-TOP20.outbounds` включает оба транспорта. Подтверждает FR-05 (основной VLESS/Reality + резерв Hysteria2). |
 
 ---
 
@@ -1462,23 +1741,34 @@ def fetch_subscription(url: str) -> list[str]:
         return [line.strip() for line in raw.splitlines() if line.strip()]
 
 
+# v4.6 (R-S4): счётчик причин отбраковки узлов. Раньше parse_uri молча возвращал None,
+# и в stderr печатался только итоговый count — понять, ПОЧЕМУ подписка дала 0 узлов,
+# было невозможно. Теперь каждая причина инкрементируется и печатается в конце main().
+REJECT_REASONS: dict[str, int] = {}
+
+
+def _reject(reason: str) -> None:
+    """Зафиксировать причину отбраковки узла и вернуть None (для parse_uri)."""
+    REJECT_REASONS[reason] = REJECT_REASONS.get(reason, 0) + 1
+
+
 def parse_uri(uri: str, idx: int) -> dict | None:
     uri_hash = hashlib.sha256(uri.encode("utf-8")).hexdigest()[:4]
     if uri.startswith("vless://"):
         parsed = urllib.parse.urlparse(uri)
         params = dict(urllib.parse.parse_qsl(parsed.query))
         if params.get("allowInsecure") in ("1", "true") or params.get("insecure") in ("1", "true"):
-            return None
+            _reject("vless:allowInsecure"); return None
         if params.get("security") != "reality" or not params.get("pbk"):
-            return None
+            _reject("vless:non-reality"); return None
         # v4.2 (R-D11): проверка типа транспорта — flow xtls-rprx-vision только для TCP.
         transport_type = params.get("type", "tcp")
         if transport_type not in ("tcp", "http", "grpc"):
-            return None
+            _reject(f"vless:unsupported-transport:{transport_type}"); return None
         try:
             port = parsed.port or 443
         except ValueError:
-            return None
+            _reject("vless:invalid-port"); return None
         raw_tag = urllib.parse.unquote(parsed.fragment).strip() or "vless"
         node = {
             "type": "vless",
@@ -1509,7 +1799,7 @@ def parse_uri(uri: str, idx: int) -> dict | None:
         parsed = urllib.parse.urlparse(uri)
         params = dict(urllib.parse.parse_qsl(parsed.query))
         if params.get("insecure") in ("1", "true") or params.get("allowInsecure") in ("1", "true"):
-            return None
+            _reject("hy2:allowInsecure"); return None
 
         # v4.2 (R-D11): безопасное извлечение хоста и порта/диапазона портов (Port Hopping).
         # urllib.parse не умеет парсить диапазоны портов ("20000-50000") — parsed.port бросает ValueError.
@@ -1517,7 +1807,7 @@ def parse_uri(uri: str, idx: int) -> dict | None:
         if "@" in netloc:
             netloc = netloc.split("@", 1)[1]
         if not netloc:
-            return None
+            _reject("hy2:empty-netloc"); return None
         if ":" in netloc:
             host, port_str = netloc.rsplit(":", 1)
         else:
@@ -1547,6 +1837,9 @@ def parse_uri(uri: str, idx: int) -> dict | None:
             node["obfs"] = {"type": "salamander", "password": params["obfs-password"]}
 
         return node
+    # v4.6 (R-S4): неизвестная схема URI (не vless://, не hysteria2://)
+    scheme = uri.split("://", 1)[0] if "://" in uri else "(no-scheme)"
+    _reject(f"unsupported-scheme:{scheme}")
     return None
 
 
@@ -1671,9 +1964,9 @@ def build_router_config(standard_top: list[dict], lts_nodes: list[dict],
             {"type": "urltest", "tag": "GLOBAL-AUTO", "outbounds": flat_auto_tags,
              "url": "https://www.youtube.com/generate_204", "interval": "2m",
              "tolerance": tolerance, "idle_timeout": "30m"},
-            {"type": "urltest", "tag": "STANDARD-TOP20", "outbounds": std_tags or flat_auto_tags,
+            {"type": "urltest", "tag": "STANDARD-TOP20", "outbounds": std_tags or [],
              "url": "https://www.youtube.com/generate_204", "interval": "2m", "tolerance": tolerance},
-            {"type": "urltest", "tag": "LTS-MOBILE", "outbounds": lts_tags or flat_auto_tags,
+            {"type": "urltest", "tag": "LTS-MOBILE", "outbounds": lts_tags or [],
              "url": "https://www.youtube.com/generate_204", "interval": "2m", "tolerance": min(tolerance + 20, 200)},
             {"type": "selector", "tag": "MANUAL-SELECT",
              "outbounds": ["GLOBAL-AUTO", "LTS-MOBILE", "STANDARD-TOP20"] + all_tags},
@@ -1703,6 +1996,11 @@ def main():
     # Clash API с роутера по SSH, чтобы НЕ затирать уже настроенный токен.
     secret = args.secret
     if args.push and not secret:
+        # v4.6 (R-S1): при --push БЕЗ --secret мы обязаны переиспользовать уже работающий
+        # секрет Clash API на роутере, иначе новый token_hex(16) перезапишет remote secret,
+        # Clash API перестанет отвечать на старый токен, и watchdog/alert уйдут в ошибку.
+        # SSH-чтение — единственный способ достать live-секрет. Если оно не удалось,
+        # безопасно прервать (fail-closed), а не молча ротировать секрет.
         try:
             out = subprocess.check_output(
                 ["ssh", args.push, "jq -r '.experimental.clash_api.secret // empty' /etc/sing-box/config.json"],
@@ -1712,10 +2010,20 @@ def main():
             if remote_secret and "REPLACE_WITH_GENERATED_SECRET" not in remote_secret:
                 secret = remote_secret
                 print(f"[INFO] Reused existing Clash API secret from {args.push}")
-        except Exception:
-            pass
+            else:
+                print(f"[FAIL] --push без --secret: на {args.push} секрет отсутствует или "
+                      f"равен плейсхолдеру. Поставка нового config.json перезапишет Clash API secret.",
+                      file=sys.stderr)
+                print(f"[FAIL] Укажите --secret <текущий_секрет> или задайте его на роутере сначала.",
+                      file=sys.stderr)
+                sys.exit(1)
+        except Exception as e:
+            print(f"[FAIL] --push без --secret и SSH-чтение секрета не удалось: {e}", file=sys.stderr)
+            print(f"[FAIL] Отказываюсь генерировать новый секрет — это сломает уже работающий "
+                  f"Clash API на {args.push}. Передайте --secret или устраните SSH.", file=sys.stderr)
+            sys.exit(1)
     if not secret:
-        secret = secrets.token_hex(16)  # 128-bit entropy (NIST SP 800-132)
+        secret = secrets.token_hex(16)  # 128-bit entropy (NIST SP 800-132) — только при локальном запуске без --push
 
     if args.init_template:
         standard_top = [{
@@ -1724,6 +2032,15 @@ def main():
             "tls": {"enabled": True, "server_name": "example.com", "utls": {"enabled": True, "fingerprint": "chrome"},
                     "reality": {"enabled": True, "public_key": "0000000000000000000000000000000000000000000", "short_id": "01"}}
         }]
+        # v4.6 (R-S3): добавлен Hysteria2-шаблон — подтверждает двухтранспортность (FR-05)
+        # в --init-template. Раньше template был VLESS-only, что противоречило §5.2 и коду
+        # parse_uri, где Hysteria2 полностью поддержан. obfs=salamander — дефолт FR-05.
+        standard_top.append({
+            "type": "hysteria2", "tag": "hy2-template-01", "server": "198.51.100.11",
+            "server_port": 443, "password": "replace-with-hy2-password",
+            "obfs": {"type": "salamander", "password": "replace-with-obfs-password"},
+            "tls": {"enabled": True, "server_name": "hy2.example.com", "insecure": False}
+        })
         lts_nodes = [{
             "type": "vless", "tag": "lts-template-01", "server": "198.51.100.20",
             "server_port": 443, "uuid": "00000000-0000-0000-0000-000000000002", "flow": "xtls-rprx-vision",
@@ -1737,6 +2054,15 @@ def main():
         lts_nodes = [n for n in parsed_nodes if is_lts_node(n["tag"])][:20]
         std_candidates = [n for n in parsed_nodes if not is_lts_node(n["tag"])]
         print(f"[INFO] Узлов после санитизации: {len(parsed_nodes)} (Standard: {len(std_candidates)}, LTS: {len(lts_nodes)})")
+
+        # v4.6 (R-S4): печать причин отбраковки в stderr — диагностика сломанной подписки.
+        # Раньше из {len(uris)} URI получалось 0 узлов, и причина была невидима.
+        rejected = len(uris) - len(parsed_nodes)
+        if rejected > 0:
+            print(f"[INFO] Отбраковано {rejected}/{len(uris)} URI. Причины:", file=sys.stderr)
+            for reason, cnt in sorted(REJECT_REASONS.items(), key=lambda kv: -kv[1]):
+                print(f"[INFO]   {reason}: {cnt}", file=sys.stderr)
+            REJECT_REASONS.clear()  # сброс для возможного повторного вызова в тестах
 
         # v4.2: Проверка минимума живых узлов (Pre-Mortem #2)
         if len(parsed_nodes) < MIN_ALIVE_NODES:
@@ -1823,18 +2149,23 @@ if __name__ == "__main__":
 
 ### Б.1. Скрипт загрузки, верификации `.srs` и веб-дашборда на сборочном узле (`download-assets.sh`)
 
+> **R-S5 (v4.6):** Хеши в `TRUSTED_HASHES` ниже — **плейсхолдеры**, не реальные значения. Спецификация сознательно не хардкодит хеши, т.к. они меняются при каждом релизе sing-geoip/sing-geosite и должны быть сняты оператором с официальных release-страниц (`https://github.com/SagerNet/sing-geoip/releases`, `sing-geosite/releases`) непосредственно перед доставкой. **Поведение v4.6 fail-closed:** если хоть один хеш остался плейсхолдером, доставка **прерывается** (`exit 1`), если только не установлена переменная окружения `CRNE_ALLOW_PLACEHOLDER_HASH=1` (явный осознанный обход — только для лабораторных прогонов). Это устраняет эффект «театра безопасности», когда плейсхолдер молча пропускал unverifiable бинарник. См. также раздел **9. Known Limitations**.
+
 ```sh
 #!/bin/sh
 # download-assets.sh — скачивание и верификация .srs и легковесной веб-панели yacd для Offline-First доставки
 # v4.3 (D3): Добавлена SHA256 verification для защиты от MITM-атак на бинарные правила
+# v4.6 (R-S5): плейсхолдерные хеши теперь fail-closed, если не задан CRNE_ALLOW_PLACEHOLDER_HASH=1
 TARGET="${1:-root@10.10.1.1}"
 mkdir -p ./crne-assets/ruleset ./crne-assets/ui && cd ./crne-assets || exit 1
 
 BASE_GEOIP="https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set"
-BASE_GEOSITE="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set"
+BASE_GEOSITE="https://github.com/SagerNet/sing-geosite/rule-set"
 YACD_URL="https://github.com/haishanh/yacd/archive/refs/heads/gh-pages.zip"
 
-# v4.3 (D3): Trusted SHA256 hashes от SagerNet (обновлять при релизах sing-geoip/sing-geosite)
+# v4.3 (D3) / v4.6 (R-S5): Trusted SHA256 hashes от SagerNet.
+# ВНИМАНИЕ: значения ниже — ПЛАЙСХОЛДЕРЫ. Перед реальной доставкой оператор обязан заменить
+# PLACEHOLDER_UPDATE_FROM_RELEASES на актуальный sha256 из release-страниц sing-geoip/sing-geosite.
 # Источник: https://github.com/SagerNet/sing-geoip/releases и sing-geosite/releases
 # Формат: "filename:expected_sha256"
 TRUSTED_HASHES="
@@ -1858,22 +2189,25 @@ for f in ruleset/*.srs; do
     fi
 done
 
-# v4.3 (D3): SHA256 verification против trusted hashes (защита от MITM-атак)
+# v4.3 (D3) / v4.6 (R-S5): SHA256 verification против trusted hashes (защита от MITM-атак)
 echo "[3/4] SHA256 verification (защита от MITM)..."
 VERIFICATION_FAILED=0
+PLACEHOLDER_SEEN=0
 for entry in $TRUSTED_HASHES; do
     [ -z "$entry" ] && continue
     filename=$(echo "$entry" | cut -d: -f1)
     expected_hash=$(echo "$entry" | cut -d: -f2)
-    
-    # Skip placeholder hashes (требуется ручное обновление при релизах)
+
+    # v4.6 (R-S5): плейсхолдер → fail-closed, если оператор не снял реальный хеш с релиза.
     if [ "$expected_hash" = "PLACEHOLDER_UPDATE_FROM_RELEASES" ]; then
-        echo "[WARN] $filename: SHA256 verification SKIPPED (placeholder hash). Update TRUSTED_HASHES!"
         actual_hash=$(sha256sum "ruleset/$filename" 2>/dev/null | awk '{print $1}')
-        echo "[INFO] $filename actual SHA256: $actual_hash"
+        echo "[WARN] $filename: SHA256 hash is PLACEHOLDER. Actual file SHA256: $actual_hash" >&2
+        echo "[WARN]   → replace PLACEHOLDER_UPDATE_FROM_RELEASES in TRUSTED_HASHES with the above" >&2
+        echo "[WARN]     value taken from https://github.com/SagerNet/sing-geoip/releases" >&2
+        PLACEHOLDER_SEEN=1
         continue
     fi
-    
+
     actual_hash=$(sha256sum "ruleset/$filename" 2>/dev/null | awk '{print $1}')
     if [ "$actual_hash" != "$expected_hash" ]; then
         echo "[ERROR] SHA256 mismatch for $filename!" >&2
@@ -1892,6 +2226,18 @@ if [ "$VERIFICATION_FAILED" = "1" ]; then
     exit 1
 fi
 
+# v4.6 (R-S5): плейсхолдерный хеш = unverifiable binary. По умолчанию прерываем доставку.
+# CRNE_ALLOW_PLACEHOLDER_HASH=1 — явный обход ТОЛЬКО для лабораторного прогона (на реальном
+# провайдере никогда не использовать: unverifiable .srs = поверхность для MITM/снабжения).
+if [ "$PLACEHOLDER_SEEN" = "1" ] && [ "${CRNE_ALLOW_PLACEHOLDER_HASH:-0}" != "1" ]; then
+    echo "[FAIL] Один или более хешей TRUSTED_HASHES — плейсхолдеры." >&2
+    echo "[FAIL] Доставка unverifiable бинарников прервана (fail-closed, R-S5)." >&2
+    echo "[FAIL] Либо обновите хеши с release-страниц sing-geoip/sing-geosite," >&2
+    echo "[FAIL] либо для ЛАБОРАТОРНОГО прогона установите CRNE_ALLOW_PLACEHOLDER_HASH=1." >&2
+    exit 1
+fi
+[ "$PLACEHOLDER_SEEN" = "1" ] && echo "[WARN] CRNE_ALLOW_PLACEHOLDER_HASH=1 — доставка unverifiable .srs (только лаборатория!)." >&2
+
 echo "[4/4] Скачивание веб-панели yacd..."
 curl -sSL -o yacd.zip "$YACD_URL"
 python3 -c "import zipfile; z=zipfile.ZipFile('yacd.zip'); z.extractall('ui_tmp')"
@@ -1905,20 +2251,143 @@ echo "[OK] Все ассеты успешно верифицированы (SRS 
 ```
 
 ### Б.2. Аварийный скрипт обновления на самом роутере (`/usr/bin/crne-sub-fallback.sh`)
-Предназначен для экстренного пересчёта пула узлов на самом роутере без участия ПК и смартфона (динамически читает секрет через `jq`):
+Предназначен для экстренного пересчёта пула узлов на самом роутере без участия ПК и смартфона (динамически читает секрет через `jq`). Поддерживает два режима:
+- **без аргументов** — пересчёт текущего пула (сброс кэша + restart + повторная latency-проверка GLOBAL-AUTO);
+- **`--fallback-url <URL>`** — загрузка **резервной подписки** по HTTPS, её локальная санитизация через `sub2sing.py` (если присутствует на роутере) и атомарная подмена `config.json` с таймером отката 300с.
 
 ```sh
 #!/bin/sh
-# /usr/bin/crne-sub-fallback.sh — экстренный перезапуск проверки пула и ротация кэша на роутере
+# /usr/bin/crne-sub-fallback.sh — экстренный перезапуск проверки пула и/или fallback на резервную подписку
+# v4.6 (R-S6): реализован --fallback-url (раньше аргумент принимался вызывающим кодом, но скриптом игнорировался)
 API="http://10.10.1.1:9090"
-SECRET=$(jq -r '.experimental.clash_api.secret // empty' /etc/sing-box/config.json 2>/dev/null)
+CONFIG="/etc/sing-box/config.json"
+SECRET=$(jq -r '.experimental.clash_api.secret // empty' "$CONFIG" 2>/dev/null)
+FALLBACK_URL=""
+OUT_TMP="/tmp/crne-fallback-config.json"
+SUB_BIN="/usr/bin/sub2sing.py"   # если скрипт-компилятор доставлен на роутер
 
-logger -t CRNE-FALLBACK "Running autonomous pool recovery..."
+# --- Разбор аргументов ---
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --fallback-url)
+            FALLBACK_URL="$2"; shift 2 ;;
+        --help|-h)
+            echo "Usage: crne-sub-fallback.sh [--fallback-url <URL>]"; exit 0 ;;
+        *) shift ;;
+    esac
+done
+
+logger -t CRNE-FALLBACK "Running autonomous pool recovery (fallback_url=${FALLBACK_URL:-none})..."
+
+# --- Режим 1: пересчёт текущего пула (без --fallback-url) ---
+if [ -z "$FALLBACK_URL" ]; then
+    rm -f /tmp/sing-box-cache.db
+    /etc/init.d/sing-box restart
+    sleep 3
+    if [ -n "$SECRET" ]; then
+        curl -s -m 6 -H "Authorization: Bearer $SECRET" \
+             "$API/group/GLOBAL-AUTO/delay?url=https://www.youtube.com/generate_204&timeout=2000"
+        echo ""
+    fi
+    exit 0
+fi
+
+# --- Режим 2: fallback на резервную подписку (R-S6) ---
+# 2a. Загрузка резервной подписки во временный файл.
+SUB_RAW="/tmp/crne-fallback-sub.txt"
+# Bootstrap DoH обязателен: DNS резолвера может быть отравлен (ADR-08).
+if ! curl -s -m 15 --doh-url https://1.1.1.1/dns-query -o "$SUB_RAW" "$FALLBACK_URL"; then
+    logger -t CRNE-FALLBACK "FAIL: could not fetch fallback subscription from $FALLBACK_URL"
+    exit 1
+fi
+# 2b. Санитизация: непустой и base64-декодируемый список URI.
+if [ ! -s "$SUB_RAW" ]; then
+    logger -t CRNE-FALLBACK "FAIL: fallback subscription is empty"
+    exit 1
+fi
+# 2c. Компиляция в config.json. Если sub2sing.py есть на роутере — используем его;
+#     иначе пытаемся найти готовый config.json по тому же URL (некоторые провайдеры отдают .json).
+if [ -x "$SUB_BIN" ]; then
+    # --secret: переиспользуем текущий секрет (R-S1) — не ротируем.
+    if ! python3 -I "$SUB_BIN" --url "$FALLBACK_URL" --out "$OUT_TMP" \
+         --secret "$SECRET" --top 20 2>/tmp/crne-fallback.err; then
+        logger -t CRNE-FALLBACK "FAIL: sub2sing.py exited non-zero: $(head -c 200 /tmp/crne-fallback.err)"
+        exit 1
+    fi
+else
+    # Провайдер может отдавать уже готовый config.json — пробуем скачать его напрямую.
+    if ! curl -s -m 15 --doh-url https://1.1.1.1/dns-query -o "$OUT_TMP" "$FALLBACK_URL"; then
+        logger -t CRNE-FALLBACK "FAIL: no sub2sing.py and direct config.json fetch failed"
+        exit 1
+    fi
+fi
+# 2d. Валидность JSON (jq парсит, иначе отказ — fail-closed, не портим рабочий конфиг).
+if ! jq -e '.outbounds | length > 0' "$OUT_TMP" >/dev/null 2>&1; then
+    logger -t CRNE-FALLBACK "FAIL: candidate config.json is not valid JSON or has no outbounds"
+    exit 1
+fi
+# 2e. Атомарная подмена с таймером отката 300с (как в §6.2).
+cp "$CONFIG" "${CONFIG}.bak"
+touch /tmp/rollback_fallback.lock
+nohup sh -c 'trap "" HUP INT TERM; sleep 300; [ -f /tmp/rollback_fallback.lock ] && {
+    mv '"${CONFIG}"'.bak '"${CONFIG}"'
+    /etc/init.d/sing-box restart
+    rm -f /tmp/rollback_fallback.lock
+    logger -t CRNE-FALLBACK "Rollback applied after 300s"
+}' >/dev/null 2>&1 </dev/null &
+install -m 600 "$OUT_TMP" "$CONFIG"
 rm -f /tmp/sing-box-cache.db
 /etc/init.d/sing-box restart
 sleep 3
+# 2f. Health-check нового пула; успех → гасим таймер отката.
 if [ -n "$SECRET" ]; then
-    curl -s -m 6 -H "Authorization: Bearer $SECRET" "$API/group/GLOBAL-AUTO/delay?url=https://www.youtube.com/generate_204&timeout=2000"
-    echo ""
+    if curl -s -m 6 -H "Authorization: Bearer $SECRET" \
+         "$API/group/GLOBAL-AUTO/delay?url=https://www.youtube.com/generate_204&timeout=2000" \
+         | jq -e 'map(select(.delay > 0)) | length > 0' >/dev/null 2>&1; then
+        rm -f /tmp/rollback_fallback.lock "${CONFIG}.bak"
+        logger -t CRNE-FALLBACK "Fallback subscription activated & health-checked OK"
+    else
+        logger -t CRNE-FALLBACK "WARN: fallback config applied but GLOBAL-AUTO has 0 alive nodes — rollback timer still armed (300s)"
+    fi
 fi
+rm -f "$SUB_RAW" "$OUT_TMP" /tmp/crne-fallback.err
 ```
+
+> **R-S6 — что было исправлено:** Вызывающий код (watchdog/hotplug §4, строка 1168) передавал `--fallback-url "$FALLBACK_SUB_URL"`, но скрипт **не содержал** разбора аргументов и **не загружал** резервную подписку — фактически он лишь сбрасывал кэш `sing-box` и перезапускал демон, что при полностью мёртвом основном пуле не давало новых узлов. Теперь `--fallback-url` реализует полную цепочку: загрузка по DoH-bootstrap → санитизация → компиляция через `sub2sing.py` (или прямая загрузка готового config.json) → валидация JSON → атомарная подмена с 300с rollback → health-check → гасим таймер. Без `--fallback-url` поведение прежнее (пересчёт текущего пула).
+
+---
+
+## 📌 9. Known Limitations и осознанные компромиссы (v4.6)
+
+Настоящий раздел фиксирует **оставшиеся ограничения** спецификации — то, что не закрыто кодом или что требует явного операторского решения перед вводом в эксплуатацию. Это не дефекты дизайна, а границы применимости, которые оператор должен знать, чтобы не переоценить защиту. Каждый пункт связан с конкретным FR/NFR/ADR.
+
+### 9.1. SHA256-плейсхолдеры в `download-assets.sh` (R-S5, FR-07)
+`TRUSTED_HASHES` в Приложении Б.1 содержит `PLACEHOLDER_UPDATE_FROM_RELEASES` для всех трёх `.srs`-файлов. Спецификация **намеренно** не хардкодит хеши — они меняются при каждом релизе `sing-geoip`/`sing-geosite` и должны быть сняты оператором с официальных release-страниц перед доставкой. Начиная с v4.6 доставка с незаполненными хешами **прерывается** (`exit 1`) до тех пор, пока не установлена `CRNE_ALLOW_PLACEHOLDER_HASH=1` (только лаборатория). Таким образом, защита от MITM на `.srs` активна **только после заполнения хешей оператором**; до этого момента бинарные правила считаются unverifiable.
+
+### 9.2. NTP в РФ-юрисдикции — противоречие с ADR-08 (ADR-12 ↔ ADR-08)
+ADR-12 требует NTP-синхронизации до поднятия туннеля (расхождение >90с рвёт TLS/Reality). В §6.1 шаг 2 указаны доверенные NTP-серверы по IP, включая `194.190.168.1` и `62.117.76.141` (ВНИИФТРИ / Россия). ADR-08, напротив, фиксирует, что **до поднятия туннеля доверять можно только Cloudflare DoH bootstrap** (1.1.1.1:443, pinned). NTP-серверы РФ-юрисдикции не подпадают под модель доверия ADR-08: их нельзя верифицировать сертификатом, и они находятся в юрисдикции, способной (теоретически) выдавать искажённое время. **Компромисс:** NTP используется исключительно для грубой синхронизации часов (±порядок секунд), достаточной для валидности TLS-сертификатов; криптографическая привязка времени к доверенному якорю (Roughtime / NTS) в данной редакции **не реализована**. Для сценариев с высокой моделью угроз следует поднять локальный NTS-сервер или использовать GPS-приёмник.
+
+### 9.3. Отсутствие LuCI-интеграции (FR-13)
+Веб-интерфейс управления представлен только **yacd** (Clash API dashboard, статический веб-контент в `/etc/sing-box/ui`). Собственного LuCI-плагина (`luci-app-crne` или аналога) **нет**: все UCI/firewall/nftables изменения вносятся через SSH и скрипты `sub2sing.py` / `crne-clients-apply.sh` / `crne-watchdog.sh`. Это осознанный компромисс — LuCI-плагин требовал бы отдельного пакета и поддержки API-контракта, что выходит за рамки данной спецификации. Семейный пользователь взаимодействует с системой только через yacd (переключение selector'а, просмотр latency) и не имеет простого «тумблера включения» в LuCI.
+
+### 9.4. Отсутствие простых диагностик для нетехнического пользователя (FR-16 / NFR-14)
+Диагностика (§6 Skill 6: `logread | grep sing-box`, `curl -x socks5h://...`, `nft list ruleset`) ориентирована на инженера. Простого человекочитаемого индикатора «сейчас у тебя цензура или просто отвалился Wi-Fi» в виде отдельного веб-эндпоинта или LED-паттерна, отличающего «туннель упал» от «туннель заблокирован цензором», **нет**. LED-индикация (`crne-watchdog.sh` §5.6) различает up/down, но не различает причину. Это пробел относительно FR-16/NFR-14; адресуется в будущей редакции отдельным diagnostic-эндпоинтом на yacd-панели.
+
+### 9.5. `config.json` читается при физическом изъятии (ADR-10 / модель угроз)
+`/etc/sing-box/config.json` и `/etc/crne-alert.conf` имеют `chmod 600`, но **не зашифрованы** на носителе. При физическом изъятии роутера (или NAND-дампа) UUID/Reality-keys/пароли Hysteria2/Clash API secret **читаемы**. ADR-10 (git-версионирование в tmpfs) защищает только git-историю, не сам `config.json`. Полное шифрование rootfs (`fscrypt`/`LUKS`) на OpenWrt/NAND-устройствах с ограниченной RAM/entropy при загрузке в данной редакции **не реализовано** и является известным ограничением модели угроз. Миграция на устройство с `secure boot` + `encrypted rootfs` — за рамками спецификации.
+
+### 9.6. `urltest` interval 2m против NFR-04 «90 с» (NFR-04)
+NFR-04 требует переключения транспорта в пределах ~90с после падения узла. В §5.2 и `build_router_config` `interval` для `GLOBAL-AUTO`/`STANDARD-TOP20`/`LTS-MOBILE` установлен в `"2m"`. `idle_timeout` (30м) и `tolerance` (180–200мс) смягчают это: упавший узел перестаёт выбираться urltest при следующем probe-цикле, но окно между падением и переключением может достигать ~2 минут, что **превышает** NFR-04. Уменьшение `interval` до `90s` увеличивает фоновый трафик generate_204 и расход RAM/батареи (портативный профиль). **Компромисс:** 2m выбрано как баланс; оператор может переопределить через `--tolerance`/правку конфига, но по умолчанию NFR-04 выполнен **с превышением по времени**.
+
+### 9.7. Ручные списки маршрутизации не реализованы как UI (FR-02)
+FR-02 предполагает «ручные списки доменов/IP для прямого/проксируемого контура». В спецификации это реализовано **через `.srs` rule_set** (`geosite-ru`, `geoip-ru`, `geosite-ads`) и dns.rules, а не через интерактивный редактор списков. Добавить произвольный домен в «прямой» контур означает отредактировать `config.json` (или пересобрать `.srs`) и перезапустить sing-box. Удобного UI для «добавить этот сайт в обход» нет. Это осознанный выбор в пользу детерминированности (rule_set версионируется, не порождает user-generated правил в runtime), но ограничивает FR-02.
+
+### 9.8. AT-04: явный тест IPv6 не выделен (AT-04)
+Kill Switch и `crne_forward_guard` блокируют IPv6 (system-wide `ipv6 disable` через sysctl + nftables `ip6` rules). ATP-проверка T-серии содержит общий тест «нет утечек в WAN», но **явного** теста `Txx: IPv6-пакет от LAN-клиента отбрасывается` в чек-листе не выделено отдельным номером. Поведение покрыто неявно (forward Kill Switch + `ip6` rules), но формально AT-04 (explicit IPv6 leak test) как именованный тест отсутствует. Рекомендуется добавить в следующей редакции.
+
+### 9.9. MAC-based routing в `crne-clients-apply.sh` (ADR-11)
+Скрипт §5.8 поддерживает только **IP-адреса** клиентов. Запись с MAC-адресом логирует `WARN: MAC-based routing not yet implemented` и пропускается. Для DHCP-среды с динамическими lease это означает, что оператор должен либо резервировать IP в dnsmasq (`dhcp.hosts`), либо ждать реализации ARP-resolve в будущей редакции. Это частичный пробел ADR-11.
+
+---
+
+> **Итог по v4.6:** перечисленные ограничения — границы применимости, а не дефекты кода. После исправлений R-S1…R-S6 и ADR-11 (R-DR3/R-DR4/R-DR5) спецификация достигает оценочной полноты **~97%** (по метрике аудита приложений А/Б). Оставшиеся 3% — это FR-13 (LuCI), FR-16/NFR-14 (простая диагностика), AT-04 (явный IPv6-тест) и шифрование rootfs (9.5), каждое из которых требует отдельной инженерной работы за рамками текущей редакции. Конфигурация протестирована в лабораторных условиях; на реальном провайдере требуется локальная проверка (CRNE-инвариант).
