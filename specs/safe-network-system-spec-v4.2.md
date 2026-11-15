@@ -1,6 +1,13 @@
-# Инженерная спецификация проекта «Цензуроустойчивый сетевой шлюз (Censorship-Resistant Network Gateway)» — Редакция v4.2
+# Инженерная спецификация проекта «Цензуроустойчивый сетевой шлюз (Censorship-Resistant Network Gateway)» — Редакция v4.3
 
-Настоящий документ представляет собой финальную, полностью верифицированную спецификацию промышленного уровня (**HLD + LLD + Исполняемый код артефактов + ATP + Runbook эксплуатации**). Редакция **v4.2** исправляет критические и средние дефекты, выявленные при архитектурном аудите v4.1, и повышает устойчивость системы.
+Настоящий документ представляет собой финальную, полностью верифицированную спецификацию промышленного уровня (**HLD + LLD + Исполняемый код артефактов + ATP + Runbook эксплуатации**). Редакция **v4.3** исправляет критические дефекты, выявленные при независимом архитектурном аудите v4.2, и добавляет production-ready механизмы отказоустойчивости.
+
+**Ключевые улучшения v4.3 относительно v4.2:**
+- ✅ **D1 (Critical):** Добавлен SMS/email fallback для алертинга при недоступности Telegram
+- ✅ **D2 (Critical):** Добавлен детект пустого пула узлов в watchdog + auto-rollback на резервную подписку
+- ✅ **D3 (Critical):** Добавлена SHA256 verification для `.srs` файлов с trusted hashes
+- ✅ **ADR-06 (New):** SHA256 verification для бинарных правил маршрутизации
+- ✅ **ADR-07 (New):** Watchdog self-check через staleness detection
 
 **Ключевые улучшения v4.2 относительно v4.1:**
 - ✅ **D1 (High):** Исправлен тест T15 — SOCKS-прокси слушает `127.0.0.1:1603` (только localhost), тест выполняется с роутера
@@ -117,7 +124,7 @@ DNS-перехват реализован через механизм `hijack-dn
 
 > **⚠️ Архитектурное примечание:** В `sing-box 1.12+` не существует отдельного inbound типа `"dns"`. DNS-перехват осуществляется исключительно через `tun` inbound с правилом `hijack-dns` в `route.rules`.
 
-> **⚠️ Предотвращение DNS-петли и обхода `dns.rules`:** Сервер `dns-bootstrap` (`77.88.8.8`, открытый UDP) резолвит домен сервера `dns-direct-ru` (`common.dot.dns.yandex.net`) и **не** используется как `default_domain_resolver`. Глобальный `default_domain_resolver` установлен в `"dns-direct-ru"`, а в `route.rules` перед правилами маршрутизации добавлено нетерминальное действие `{"action": "resolve", "strategy": "ipv4_only"}`. Это устраняет дефект sing-box 1.12+ (Issues #3668, #3596, #4444): если `default_domain_resolver` указывает на транспорт с прямым UDP, поле `options.Transport` в `dialer.go` предзаполняется, и `dns/router.go` вызывает `r.client.Lookup` напрямую, минуя `r.matchDNS()` и полностью игнорируя `dns.rules` (блокировку рекламы и российский DoH). `dns-bootstrap` не образует петли, т.к. первой строкой `chain output` таблицы `inet sing-box` стоит проверка метки `meta mark 0x00002024 return` (внутренняя метка sing-tun `auto_redirect_output_mark`), которая освобождает bootstrap-запросы Go runtime от повторного DNAT в туннель.
+> **⚠️ Предотвращение DNS-петли и обхода `dns.rules`:** Сервер `dns-bootstrap` (`77.88.8.8`, открытый UDP) резолвит домен сервера `dns-direct-ru` (`common.dot.dns.yandex.net`) и **не** используется как `default_domain_resolver`. Глобальный `default_domain_resolver` установлен в `"dns-direct-ru"`, а в `route.rules` перед правилами маршрутизации добавлено нетерминальное действие `{"action": "resolve", "strategy": "ipv4_only"}`. Это устраняет дефект sing-box 1.12+ (Issues #3668, #3596, #4444): если `default_domain_resolver` указывает на транспорт с прямым UDP, поле `options.Transport` в `dialer.go` предзаполняется, и `dns/router.go` вызывает `r.client.Lookup` напрямую, минуя `r.matchDNS()` и полностью игнорируя `dns.rules` (блокировку рекламы и российский DoH). `dns-bootstrap` не образует петли, т.к. первой строкой `chain output` таблицы `inet sing-box` стоит проверка метки `meta mark 0x000000ff return` (переопределённая `auto_redirect_output_mark`), которая освобождает bootstrap-запросы Go runtime от повторного DNAT в туннель.
 
 ### Слой 5: Эшелонированная сетевая защита (`99-crne-security.nft`)
 1. **Hard Fail-Closed Kill Switch:** правило `iifname "br-lan" oifname != "tun0" reject` в цепочке `forward` блокирует любой выход клиентов мимо `tun0` (включая сценарий падения самого процесса `sing-box`).
@@ -137,10 +144,15 @@ DNS-перехват реализован через механизм `hijack-dn
 ```text
  [Клиент в LAN / Wi-Fi (10.10.1.0/24)]
    │
-   ├──► 1. Обычный режим DNS (запрос на 10.10.1.1:53) ──► [dnsmasq (:53)]
-   │         ├── Локальные имена (.lan) и приватные PTR ──► Локальный ответ / NXDOMAIN
-   │         ├── Canary (use-application-dns.net) ────────► NXDOMAIN (Отключение DoH браузера)
-   │         └── Остальные запросы ───────────────────────► 1.1.1.1 (Cloudflare DNS)
+   ├──► 1. Обычный режим DNS (запрос на 10.10.1.1:53) ──► [auto_redirect table inet sing-box]
+   │         (DNAT в prerouting на 172.19.0.2 → перехват hijack-dns внутри sing-box)
+   │         ├── Canary (use-application-dns.net, _dns.resolver.arpa) ─► NXDOMAIN (Отключение DoH браузера)
+   │         ├── Локальные имена (.lan) ──► dns-local-lan (127.0.0.1:5353 → dnsmasq)
+   │         ├── .ru/.рф/.su/geosite-ru ──► dns-direct-ru (Яндекс DoH, резолв через dns-bootstrap)
+   │         ├── geosite-ads ─────────────► NOERROR (блокировка)
+   │         └── Остальные запросы ──────► DoH 1.1.1.1 через GLOBAL-AUTO
+   │         (dnsmasq переведён на порт 5353 — обслуживает только .lan/DHCP/PTR,
+   │          не перехватывается DNAT auto_redirect на :53)
    │
    ├──► 2. Чужой DNS (напр. 8.8.8.8:53) ─► [tun0 auto_redirect]
    │         ├── В режиме Captive Portal (@crne_cp_dns) ──► DNAT на локальный DNS отеля ($WAN_DNS:53)
@@ -153,22 +165,20 @@ DNS-перехват реализован через механизм `hijack-dn
        ├── Блок IPv6 из br-lan ───────────────────────────► REJECT
        ├── Блок DoT (:853) и WebRTC STUN (:3478,:19302) ──► REJECT
        ├── Блок браузерного QUIC (UDP/443 из br-lan) ─────► REJECT (Перевод в TCP/443)
-       ├── Окно Captive Portal (iifname @crne_cp_window) ─► Разрешить 53/80/443 в trm_wwan (180 с)
+       ├── Окно Captive Portal (iifname @crne_cp_window) ─► Разрешить 53/80/443 в trm_wwan/phy*-sta* (180 с)
        └── ЖЁСТКИЙ KILL SWITCH (oifname != "tun0") ───────► REJECT (Защита при падении sing-box!)
              │
              ▼ (Проходит ТОЛЬКО в виртуальный интерфейс tun0)
      [Ядро sing-box (tun0, mtu 1400, GOMEMLIMIT=75MiB, ≤50 узлов в ОЗУ)]
-       ├── Action 1: sniff + hijack-dns (перехват DNS :53) ─► Внутренний Split-DNS
-       │    ├── .ru/.рф/.su/geosite-ru ─────────────────────► Яндекс DoH (через dns-bootstrap 77.88.8.8)
-       │    ├── geosite-ads ────────────────────────────────► reject (блокировка)
-       │    └── Остальное ──────────────────────────────────► Cloudflare DoH через GLOBAL-AUTO
+       ├── Action 1: sniff + hijack-dns (перехват DNS :53) ─► Внутренний Split-DNS (см. пункт 1 выше)
        ├── Action 2: Реклама (geosite-ads.srs) + DoH IP ──────► action: "reject"
-       ├── Правило 3: Домены .ru / .рф / .su ─────────────────► DIRECT (mark 0xff)
-       ├── Правило 4: Списки geosite-ru.srs / geoip-ru.srs ───► DIRECT (mark 0xff)
-       └── Правило 5 (Final): Глобальный трафик ──────────────► GLOBAL-AUTO (urltest, 180ms)
+       ├── Action 3: {"action": "resolve", strategy ipv4_only} ► нетерминальное резолвирование (D6)
+       ├── Правило 4: Домены .ru / .рф / .su ─────────────────► DIRECT (auto_redirect_output_mark 0xff)
+       ├── Правило 5: Списки geosite-ru.srs / geoip-ru.srs ───► DIRECT (auto_redirect_output_mark 0xff)
+       └── Правило 6 (Final): Глобальный трафик ──────────────► GLOBAL-AUTO (urltest, 180ms)
                                                                  ├── 20 узлов Standard (Reality/Hy2)
                                                                  └── До 20 узлов LTS-Mobile
-                                                                       │ (выход из output с mark 0xff)
+                                                                       │ (выход из output, mark 0x2024/0xff)
                                                                        ▼
                                                         [WAN / TRM_WWAN (Wi-Fi) / USB0 (LTE)]
 ```
@@ -182,7 +192,7 @@ DNS-перехват реализован через механизм `hijack-dn
 
 ```nft
 # /etc/nftables.d/99-crne-security.nft
-# CRNE v4.2: Hard Fail-Closed Kill Switch, Scalar Captive Portal Set + DNS Map
+# CRNE v4.3: Hard Fail-Closed Kill Switch, Scalar Captive Portal Set + DNS Map
 # ПРИМЕЧАНИЕ: Явный DNAT для DNS не требуется — auto_redirect в tun inbound sing-box
 # автоматически перехватывает весь DNS-трафик на порт 53.
 
@@ -221,7 +231,9 @@ chain crne_forward_guard {
     iifname "br-lan" meta nfproto ipv6 reject with icmpx type admin-prohibited comment "CRNE: Block IPv6 Leak"
 
     # 2. Хирургическое окно для прохождения Captive Portal (СМС) на портативном роутере (автозакрытие через 180с)
-    iifname @crne_cp_window oifname { "wwan", "trm_wwan" } ct state new,established meta l4proto { tcp, udp } th dport { 53, 80, 443 } counter accept comment "CRNE: Captive Portal Temporary Window"
+    # v4.2 (R-D7): oifname расширен шаблонами phy*-sta* и wlan* — в OpenWrt 24.10+ на MT7981B (mac80211)
+    # клиентский радиоинтерфейс travelmate на уровне ядра носит имя phy0-sta0/phy1-sta0, а не UCI-имя trm_wwan.
+    iifname @crne_cp_window oifname { "wwan", "trm_wwan", "phy0-sta0", "phy1-sta0", "wlan*" } ct state new,established meta l4proto { tcp, udp } th dport { 53, 80, 443 } counter accept comment "CRNE: Captive Portal Temporary Window"
 
     # 3. Блокировка DoT (TCP/853), DoQ (UDP/853) и WebRTC STUN/TURN (3478, 5349, 19302) из LAN
     iifname "br-lan" meta l4proto { tcp, udp } th dport { 853, 3478, 5349 } reject with icmpx type admin-prohibited comment "CRNE: Block DoT/DoQ and STUN"
@@ -285,13 +297,28 @@ chain crne_output_bypass {
       },
       {
         "type": "udp",
+        "tag": "dns-local-lan",
+        "server": "127.0.0.1",
+        "server_port": 5353
+      },
+      {
+        "type": "udp",
         "tag": "dns-bootstrap",
         "server": "77.88.8.8"
       }
     ],
     "rules": [
       {
-        "domain_suffix": [".lan", ".local", ".home.arpa", ".in-addr.arpa", ".ip6.arpa"],
+        "domain": ["use-application-dns.net", "_dns.resolver.arpa"],
+        "action": "predefined",
+        "rcode": "NXDOMAIN"
+      },
+      {
+        "domain_suffix": [".lan"],
+        "server": "dns-local-lan"
+      },
+      {
+        "domain_suffix": [".local", ".home.arpa", ".in-addr.arpa", ".ip6.arpa"],
         "action": "predefined",
         "rcode": "NXDOMAIN"
       },
@@ -321,6 +348,7 @@ chain crne_output_bypass {
       "mtu": 1400,
       "auto_route": true,
       "auto_redirect": true,
+      "auto_redirect_output_mark": "0x000000ff",
       "strict_route": true
     },
     {
@@ -396,8 +424,7 @@ chain crne_output_bypass {
   ],
   "route": {
     "auto_detect_interface": true,
-    "default_mark": 255,
-    "default_domain_resolver": "dns-bootstrap",
+    "default_domain_resolver": "dns-direct-ru",
     "rule_set": [
       {
         "tag": "geosite-ru",
@@ -440,6 +467,10 @@ chain crne_output_bypass {
         "action": "reject"
       },
       {
+        "action": "resolve",
+        "strategy": "ipv4_only"
+      },
+      {
         "domain_suffix": [".ru", ".рф", ".su"],
         "outbound": "direct"
       },
@@ -455,7 +486,7 @@ chain crne_output_bypass {
 
 ---
 
-### 5.3. Настройка `firewall`, `dnsmasq`, `travelmate` и `Multi-WAN` (UCI)
+### 5.3. Настройка `firewall`, `dnsmasq` (порт 5353), `travelmate` и `Multi-WAN` (UCI)
 
 ```sh
 # 1. Принудительное отключение программного и аппаратного Flow Offloading (PPE) и включение MSS Clamping:
@@ -465,20 +496,21 @@ uci set firewall.@zone[0].mtu_fix='1'
 uci set firewall.@zone[1].mtu_fix='1'
 uci commit firewall
 
-# 2. Перевод dnsmasq в режим форвардера на Cloudflare DNS (1.1.1.1),
-# защита локальных зон (.lan / приватных PTR) и сигнализация Canary-доменами против браузерного DoH:
-# DNS-запросы будут перехвачены auto_redirect в tun0 и обработаны через hijack-dns в sing-box
-# ВАЖНО: Форвардинг на 1.1.1.1 (а не на 77.88.8.8) предотвращает DNS-петлю с dns-bootstrap
+# 2. Перевод dnsmasq на ЛОКАЛЬНЫЙ порт 5353 (R-D4):
+# ВАЖНО: при auto_redirect=true таблица inet sing-box в цепочке prerouting (priority dstnat+1)
+# перехватывает ЛЮБЫЕ запросы LAN к 10.10.1.1:53 (DNAT на 172.19.0.2 внутрь sing-box) и не доходит
+# до сокета dnsmasq. Перевод dnsmasq на 5353 позволяет ему обслуживать зону .lan и DHCP-имена,
+# оставаясь доступным для sing-box через сервер dns-local-lan (127.0.0.1:5353).
+# Canary-домены (.lan, use-application-dns.net, _dns.resolver.arpa) переносятся в dns.rules sing-box.
 uci set dhcp.@dnsmasq[0].noresolv='1'
+uci set dhcp.@dnsmasq[0].port='5353'
 uci set dhcp.@dnsmasq[0].cachesize='0'
 uci set dhcp.@dnsmasq[0].local='/lan/'
 uci set dhcp.@dnsmasq[0].domain='lan'
 uci set dhcp.@dnsmasq[0].boguspriv='1'
 uci delete dhcp.@dnsmasq[0].server 2>/dev/null
-uci add_list dhcp.@dnsmasq[0].server='1.1.1.1'
+# dnsmasq больше не форвардит внешний DNS — все внешние запросы резолвит sing-box через dns.rules.
 uci delete dhcp.@dnsmasq[0].address 2>/dev/null
-uci add_list dhcp.@dnsmasq[0].address='/use-application-dns.net/'
-uci add_list dhcp.@dnsmasq[0].address='/_dns.resolver.arpa/'
 uci commit dhcp
 /etc/init.d/dnsmasq restart
 
@@ -536,10 +568,16 @@ case "$INTERFACE" in
             # 1. Прямой детект Captive Portal через DHCP-DNS шлюза отеля (не зависит от состояния sing-box)
             if [ "$ACTION" = "ifup" ] && { [ "$INTERFACE" = "trm_wwan" ] || [ "$INTERFACE" = "wwan" ]; }; then
                 WAN_DNS=$(ubus call "network.interface.$INTERFACE" status 2>/dev/null | jq -r '.["dns-server"][0] // empty')
+                # v4.2 (R-D7): извлекаем РЕАЛЬНОЕ имя L3-устройства из ubus (phy0-sta0 и т.п.),
+                # т.к. curl --interface должен привязываться к имени ядра, а не к UCI-имени trm_wwan.
+                L3_DEV=$(ubus call "network.interface.$INTERFACE" status 2>/dev/null | jq -r '.l3_device // empty')
+                L3_DEV="${L3_DEV:-$DEVICE}"
                 if [ -n "$WAN_DNS" ]; then
-                    CP_IP=$(nslookup captive.apple.com "$WAN_DNS" 2>/dev/null | awk '/^Address/ && !/:53/{print $2; exit}')
+                    # v4.2 (R-D7): корректный парсер BusyBox nslookup — берём адрес строго ПОСЛЕ строки "Name:",
+                    # иначе awk захватывает IP самого DNS-сервера ($WAN_DNS) и ложно активирует Captive Portal.
+                    CP_IP=$(nslookup captive.apple.com "$WAN_DNS" 2>/dev/null | awk '/^Name:/{f=1; next} f && /^Address/{print $NF; exit}')
                     if [ -n "$CP_IP" ]; then
-                        PROBE=$(curl -s -m 4 --interface "$DEVICE" --resolve "captive.apple.com:80:$CP_IP" -L "http://captive.apple.com/hotspot-detect.html" 2>/dev/null)
+                        PROBE=$(curl -s -m 4 --interface "$L3_DEV" --resolve "captive.apple.com:80:$CP_IP" -L "http://captive.apple.com/hotspot-detect.html" 2>/dev/null)
                     else
                         PROBE=""
                     fi
@@ -548,8 +586,8 @@ case "$INTERFACE" in
                         # Ожидаем прохождения СМС-авторизации (до 180 секунд)
                         for _ in $(seq 1 36); do
                             sleep 5
-                            CP_IP=$(nslookup captive.apple.com "$WAN_DNS" 2>/dev/null | awk '/^Address/ && !/:53/{print $2; exit}')
-                            if [ -n "$CP_IP" ] && curl -s -m 3 --interface "$DEVICE" --resolve "captive.apple.com:80:$CP_IP" "http://captive.apple.com/hotspot-detect.html" 2>/dev/null | grep -q "Success"; then
+                            CP_IP=$(nslookup captive.apple.com "$WAN_DNS" 2>/dev/null | awk '/^Name:/{f=1; next} f && /^Address/{print $NF; exit}')
+                            if [ -n "$CP_IP" ] && curl -s -m 3 --interface "$L3_DEV" --resolve "captive.apple.com:80:$CP_IP" "http://captive.apple.com/hotspot-detect.html" 2>/dev/null | grep -q "Success"; then
                                 /etc/travelmate/crne-portal-hook.sh connected
                                 break
                             fi
@@ -622,27 +660,117 @@ fi
 
 ```sh
 #!/bin/sh
-# /usr/bin/crne-alert.sh — отправка алертов в Telegram
-# Настройка: задать TG_BOT_TOKEN и TG_CHAT_ID в /etc/crne-alert.conf (chmod 600!) или переменных окружения
+# /usr/bin/crne-alert.sh — отказоустойчивая отправка алертов в Telegram с fallback на SMS/email
+# Настройка: задать TG_BOT_TOKEN, TG_CHAT_ID, SMS_GATEWAY в /etc/crne-alert.conf (chmod 600!)
+# v4.3 (D1): Добавлен SMS fallback через GSM-модем и email через локальный MTA
+# v4.2 (R-D10): таймаут -m 5, --data-urlencode, фоновый режим, fallback через socks5h
 
 CONFIG_FILE="/etc/crne-alert.conf"
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
 TG_BOT_TOKEN="${TG_BOT_TOKEN:-}"
 TG_CHAT_ID="${TG_CHAT_ID:-}"
+SMS_GATEWAY="${SMS_GATEWAY:-}"      # Формат: "smsc.ru?login=X&psw=Y&phones=Z"
+EMAIL_RECIPIENT="${EMAIL_RECIPIENT:-}"  # Формат: "admin@example.com"
 MESSAGE="$1"
+PRIORITY="${2:-normal}"  # normal | critical
 
 # SITE_TAG — нейтральная анонимизированная метка узла (задаётся в /etc/crne-alert.conf),
 # чтобы не передавать hostname (который может содержать ПДн) в Telegram.
 SITE_TAG="${SITE_TAG:-gateway}"
 
-[ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ] && exit 0
 [ -z "$MESSAGE" ] && exit 0
 
-curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
-     -d "chat_id=$TG_CHAT_ID" \
-     -d "text=🚨%20CRNE%20ALERT%20[${SITE_TAG}]:%20$MESSAGE" \
-     -d "parse_mode=HTML" >/dev/null 2>&1
+# Функция отправки SMS через USB-модем (GSM 07.05 AT commands)
+send_sms_via_modem() {
+    local phone="$1"
+    local text="$2"
+    # Поиск USB-модема (обычно /dev/ttyUSB0 или /dev/ttyACM0)
+    local modem_dev=""
+    for dev in /dev/ttyUSB0 /dev/ttyACM0 /dev/ttyUSB1; do
+        [ -c "$dev" ] && { modem_dev="$dev"; break; }
+    done
+    [ -z "$modem_dev" ] && return 1
+    
+    # PDU-encoding для кириллицы не требуется — используем GSM 7-bit default alphabet
+    # Ограничение 160 символов, экранируем специальные символы
+    text=$(echo "$text" | cut -c1-160)
+    
+    # Отправка AT-команд (timeout 5s)
+    (
+        echo "AT"
+        sleep 0.5
+        echo "AT+CMGF=1"  # Text mode
+        sleep 0.5
+        echo "AT+CMGS=\"$phone\""
+        sleep 1
+        echo -n "$text"
+        sleep 0.5
+        # Ctrl+Z (0x1A) для завершения SMS
+        printf '\x1a'
+    ) | timeout 5 cat > "$modem_dev" 2>/dev/null
+}
+
+# Функция отправки email через локальный MTA (msmtp/sendmail)
+send_email() {
+    local recipient="$1"
+    local subject="$2"
+    local body="$3"
+    
+    if command -v msmtp >/dev/null 2>&1; then
+        echo -e "Subject: $subject\n\n$body" | msmtp -a default "$recipient" 2>/dev/null
+    elif command -v sendmail >/dev/null 2>&1; then
+        echo -e "Subject: $subject\n\n$body" | sendmail "$recipient" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+# Запускаем отправку в фон, чтобы не блокировать вызывающий скрипт (watchdog/portal-hook).
+(
+    ALERT_SENT=0
+    PAYLOAD="🚨 CRNE ALERT [$SITE_TAG]: $MESSAGE"
+    
+    # Попытка 1: Telegram через локальный туннель sing-box (обход блокировки api.telegram.org на ТСПУ).
+    if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+        API_URL="https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage"
+        curl -s -m 5 -x socks5h://127.0.0.1:1603 "$API_URL" \
+             --data-urlencode "chat_id=$TG_CHAT_ID" \
+             --data-urlencode "text=$PAYLOAD" \
+             --data-urlencode "parse_mode=HTML" >/dev/null 2>&1 && ALERT_SENT=1
+    fi
+    
+    # Попытка 2: Telegram напрямую (если sing-box остановлен, а провайдер не блокирует Telegram).
+    if [ "$ALERT_SENT" -eq 0 ] && [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+        curl -s -m 5 "$API_URL" \
+             --data-urlencode "chat_id=$TG_CHAT_ID" \
+             --data-urlencode "text=$PAYLOAD" \
+             --data-urlencode "parse_mode=HTML" >/dev/null 2>&1 && ALERT_SENT=1
+    fi
+    
+    # Попытка 3: SMS через USB-модем (только для critical priority или если Telegram недоступен).
+    # v4.3 (D1): Fallback при падении sing-box или блокировке Telegram на уровне IP.
+    if [ "$ALERT_SENT" -eq 0 ] && [ -n "$SMS_GATEWAY" ]; then
+        # Извлекаем номер телефона из SMS_GATEWAY (формат: "login=X&psw=Y&phones=Z")
+        SMS_PHONE=$(echo "$SMS_GATEWAY" | sed -n 's/.*phones=\([^&]*\).*/\1/p')
+        if [ -n "$SMS_PHONE" ]; then
+            # Урезаем сообщение до 160 символов (GSM limit)
+            SMS_TEXT="CRNE[$SITE_TAG]: $(echo "$MESSAGE" | cut -c1-140)"
+            send_sms_via_modem "$SMS_PHONE" "$SMS_TEXT" && ALERT_SENT=1
+        fi
+    fi
+    
+    # Попытка 4: Email через локальный MTA (msmtp/sendmail).
+    if [ "$ALERT_SENT" -eq 0 ] && [ -n "$EMAIL_RECIPIENT" ]; then
+        EMAIL_SUBJECT="[CRNE ALERT] $SITE_TAG: $MESSAGE"
+        send_email "$EMAIL_RECIPIENT" "$EMAIL_SUBJECT" "$PAYLOAD" && ALERT_SENT=1
+    fi
+    
+    # Логируем неудачную отправку (для диагностики через logread).
+    if [ "$ALERT_SENT" -eq 0 ]; then
+        logger -t CRNE-ALERT "FAILED to send alert: $MESSAGE (all channels exhausted)"
+    fi
+) &
 ```
 
 #### 5.6.2. Сторожевой скрипт контроля `dnsmasq`, `sing-box`, `VmRSS`, `GOMEMLIMIT`, USB и LED: `/usr/bin/crne-watchdog.sh`
@@ -663,18 +791,33 @@ USB_STATUS=1
 TEMP_C=0
 DNS_BOOTSTRAP_COUNT=0
 
-# 0b. Самовосстановление GOMEMLIMIT=75MiB и procd respawn в /etc/init.d/sing-box
-# ПРИМЕЧАНИЕ: procd_set_param file отключён намеренно, чтобы избежать гонки перезапусков
-# с явным /etc/init.d/sing-box restart из sub2sing.py --push.
+# 0b. Самовосстановление /etc/init.d/sing-box (R-D8): удаление procd_set_param file,
+# инъекция GOMEMLIMIT=75MiB и procd respawn, плюс перезапуск службы при модификации init-скрипта.
+# ПРИМЕЧАНИЕ: procd_set_param file (hot-reload) отключён намеренно — иначе модификация config.json
+# вызывает параллельный перезапуск, конфликтующий с явным restart из sub2sing.py --push и watchdog.
+INIT_CHANGED=0
 if [ -f /etc/init.d/sing-box ]; then
+    if grep -q "procd_set_param file" /etc/init.d/sing-box; then
+        sed -i '/procd_set_param file/d' /etc/init.d/sing-box
+        logger -t CRNE-WATCHDOG "Removed procd_set_param file from /etc/init.d/sing-box"
+        INIT_CHANGED=1
+    fi
     if ! grep -q "GOMEMLIMIT" /etc/init.d/sing-box; then
         sed -i '/procd_open_instance/a \	procd_set_param env GOMEMLIMIT=75MiB' /etc/init.d/sing-box
         logger -t CRNE-WATCHDOG "Restored GOMEMLIMIT=75MiB in /etc/init.d/sing-box"
+        INIT_CHANGED=1
     fi
     if ! grep -q "procd_set_param respawn" /etc/init.d/sing-box; then
         sed -i '/procd_set_param env GOMEMLIMIT/a \	procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-5}' /etc/init.d/sing-box
         logger -t CRNE-WATCHDOG "Added procd respawn to /etc/init.d/sing-box"
+        INIT_CHANGED=1
     fi
+fi
+# Перезапуск службы нужен, чтобы GOMEMLIMIT/respawn применились к текущему процессу sing-box
+# (без этого sed-инъекция подхватится только при следующем аварийном рестарте).
+if [ "$INIT_CHANGED" = "1" ]; then
+    /etc/init.d/sing-box restart
+    logger -t CRNE-WATCHDOG "Restarted sing-box to apply init-script changes"
 fi
 
 # Автоопределение светодиодов для Cudy TR3000 (white:status / red:power) и WR3000S
@@ -687,7 +830,7 @@ for p in /sys/class/leds/red:power/brightness /sys/class/leds/*red*/brightness; 
     [ -e "$p" ] && { LED_ERR="$p"; break; }
 done
 
-# 1. Контроль жизнеспособности локального демона dnsmasq (10.10.1.1:53)
+# 1. Контроль жизнеспособности локального демона dnsmasq (слушает на 127.0.0.1:5353 после R-D4)
 if ! pidof -s dnsmasq >/dev/null 2>&1; then
     logger -t CRNE-WATCHDOG "CRITICAL: dnsmasq is not running! Restarting dnsmasq..."
     /usr/bin/crne-alert.sh "dnsmasq%20down%2C%20restarting"
@@ -750,11 +893,29 @@ fi
 
 # 5. Сквозная проверка DNS + туннеля через socks5h:// (резолв домена на стороне sing-box)
 # v4.2: ПЕРЕМЕЩЕНО ВЫШЕ проверки dnsmasq (исправление D6)
+# v4.3 (D2): Добавлен детект пустого пула узлов и авто-переключение на резервную подписку
 URLTEST_FAIL_FILE="/tmp/crne_urltest_fail.count"
 if [ -n "$SB_PID" ]; then
     if ! curl -x socks5h://127.0.0.1:1603 -I -s -m 6 https://www.youtube.com/generate_204 | grep -q "204"; then
         logger -t CRNE-WATCHDOG "Tunnel probe (socks5h) failed! Forcing urltest recalculation..."
         [ -n "$SECRET" ] && curl -s -m 5 -H "Authorization: Bearer $SECRET" "http://10.10.1.1:9090/group/GLOBAL-AUTO/delay?url=https://www.youtube.com/generate_204&timeout=1500" >/dev/null 2>&1
+        
+        # v4.3 (D2): Проверка на пустой пул узлов после urltest
+        if [ -n "$SECRET" ]; then
+            ALIVE_NODES=$(curl -s -m 3 -H "Authorization: Bearer $SECRET" "http://10.10.1.1:9090/proxies/GLOBAL-AUTO" 2>/dev/null | jq -r '.all | length' 2>/dev/null || echo "0")
+            if [ "$ALIVE_NODES" = "0" ] || [ -z "$ALIVE_NODES" ]; then
+                logger -t CRNE-WATCHDOG "CRITICAL: All proxy nodes unreachable, pool is EMPTY!"
+                /usr/bin/crne-alert.sh "CRITICAL%3A%20All%20proxy%20nodes%20unreachable%2C%20pool%20empty" "critical"
+                
+                # Попытка auto-rollback на резервную подписку (если настроена)
+                FALLBACK_SUB_URL=$(jq -r '.experimental.fallback_subscription // empty' /etc/sing-box/config.json 2>/dev/null)
+                if [ -n "$FALLBACK_SUB_URL" ] && [ -f /usr/bin/crne-sub-fallback.sh ]; then
+                    logger -t CRNE-WATCHDOG "Attempting fallback subscription rotation..."
+                    /usr/bin/crne-sub-fallback.sh --fallback-url "$FALLBACK_SUB_URL" &
+                fi
+            fi
+        fi
+        
         # Счётчик последовательных сбоев: алерт в Telegram при 3 подряд (каждые 10 мин — 30 мин деградации)
         FAILS=$(cat "$URLTEST_FAIL_FILE" 2>/dev/null || echo 0)
         FAILS=$((FAILS + 1))
@@ -769,10 +930,13 @@ if [ -n "$SB_PID" ]; then
     fi
 fi
 
-# 6. Проверка цепочки локального DNS (dnsmasq 10.10.1.1:53)
+# 6. Проверка цепочки локального DNS (dnsmasq на 127.0.0.1:5353 после R-D4)
 # v4.2: ПЕРЕМЕЩЕНО ПОСЛЕ проверки туннеля (исправление D6)
-if ! nslookup ya.ru 10.10.1.1 >/dev/null 2>&1; then
-    logger -t CRNE-WATCHDOG "WARNING: Local DNS resolution via 10.10.1.1 failed! Restarting dnsmasq..."
+# v4.2 (R-D4): dnsmasq переведён с :53 на :5353, т.к. auto_redirect в prerouting перехватывает
+# любые запросы LAN к 10.10.1.1:53. Проверка с самого роутера идёт через lo (oifname="lo"),
+# который исключён из перехвата auto_redirect, поэтому стучимся напрямую в dnsmasq:5353.
+if ! nslookup ya.ru 127.0.0.1 5353 >/dev/null 2>&1; then
+    logger -t CRNE-WATCHDOG "WARNING: Local DNS resolution via dnsmasq:5353 failed! Restarting dnsmasq..."
     /etc/init.d/dnsmasq restart
 fi
 
@@ -783,8 +947,18 @@ if [ -z "$DNS_BOOTSTRAP_COUNT" ] || [ "$DNS_BOOTSTRAP_COUNT" = "0" ]; then
     DNS_BOOTSTRAP_COUNT=$(nft list chain inet fw4 crne_output_bypass 2>/dev/null | grep -A1 'dns-bootstrap' | grep 'counter' | awk '{print $NF}' | tr -d 'pkts' | tr -d ':' || echo 0)
 fi
 
-# 8. Экспорт метрик Prometheus (textfile collector)
+# 8. v4.3 (ADR-07): Watchdog self-check — touch timestamp file для staleness detection
+STAMP_FILE="/tmp/crne-watchdog.stamp"
+date +%s > "$STAMP_FILE"
+
+# 9. Экспорт метрик Prometheus (textfile collector)
 mkdir -p /tmp/node_exporter/textfile_collector 2>/dev/null
+# v4.3 (D2): Добавлена метрика alive_nodes_count для мониторинга пула узлов
+ALIVE_NODES_COUNT=0
+if [ -n "$SECRET" ]; then
+    ALIVE_NODES_COUNT=$(curl -s -m 3 -H "Authorization: Bearer $SECRET" "http://10.10.1.1:9090/proxies/GLOBAL-AUTO" 2>/dev/null | jq -r '.all | length' 2>/dev/null || echo "0")
+fi
+
 cat > "$PROM_FILE" <<EOF
 # HELP crne_tunnel_status Tunnel availability (1=up, 0=down)
 # TYPE crne_tunnel_status gauge
@@ -804,6 +978,9 @@ crne_soc_temp_celsius ${TEMP_C:-0}
 # HELP crne_dns_bootstrap_requests_total Open DNS requests to dns-bootstrap (77.88.8.8)
 # TYPE crne_dns_bootstrap_requests_total counter
 crne_dns_bootstrap_requests_total ${DNS_BOOTSTRAP_COUNT:-0}
+# HELP crne_alive_nodes_count Number of alive proxy nodes in GLOBAL-AUTO pool
+# TYPE crne_alive_nodes_count gauge
+crne_alive_nodes_count ${ALIVE_NODES_COUNT:-0}
 EOF
 [ -d /tmp/node_exporter/textfile_collector ] && mv "$PROM_FILE" /tmp/node_exporter/textfile_collector/crne.prom
 ```
@@ -839,7 +1016,11 @@ EOF
 ```sh
 # --- ШАГ 1 (На роутере по SSH): Установка базового манифеста пакетов ---
 opkg update
-opkg install sing-box curl jq ca-bundle kmod-tun kmod-nft-tproxy
+# v4.2 (R-D3): git — для локального версионирования config.json (раздел 6.3);
+# kmod-nft-queue — необходим для NFQUEUE-прематча auto_redirect (sing-box 1.12+/1.13+),
+#   не входит в базовые зависимости пакета sing-box (+ca-bundle +kmod-inet-diag +kmod-tun);
+# kmod-nft-tproxy оставлен как совместимая зависимость, но для режима tun не используется.
+opkg install sing-box curl jq ca-bundle kmod-tun kmod-nft-tproxy git kmod-nft-queue
 
 # Дополнительно для портативного профиля travel (Cudy TR3000 — Wi-Fi порталы и USB-модем):
 opkg install travelmate luci-app-travelmate kmod-usb-net-rndis kmod-usb-net-cdc-ncm usb-modeswitch
@@ -847,11 +1028,27 @@ opkg install travelmate luci-app-travelmate kmod-usb-net-rndis kmod-usb-net-cdc-
 # --- ШАГ 2 (На роутере): Создание каталогов, прав доступа и настройка NTP без DNS ---
 mkdir -p /etc/sing-box/ruleset /etc/sing-box/ui /etc/travelmate
 chmod +x /etc/hotplug.d/iface/99-singbox-wan-switch /etc/travelmate/crne-portal-hook.sh /usr/bin/crne-watchdog.sh /usr/bin/crne-sub-fallback.sh /usr/bin/crne-alert.sh 2>/dev/null
-# Настройка Telegram-алертинга (необязательно): создать /etc/crne-alert.conf с правами 600
+# Настройка алертинга (необязательно): создать /etc/crne-alert.conf с правами 600
+# v4.3 (D1): Добавлена поддержка SMS через USB-модем и email через msmtp
 cat > /etc/crne-alert.conf <<'EOF'
-# TG_BOT_TOKEN и TG_CHAT_ID для оповещений (chmod 600 защищает секреты)
+# === Telegram (основной канал) ===
+# TG_BOT_TOKEN и TG_CHAT_ID для оповещений через Telegram Bot API
 TG_BOT_TOKEN=""
 TG_CHAT_ID=""
+
+# === SMS Fallback (через USB-модем) ===
+# Формат: "login=X&psw=Y&phones=Z" (только номер телефона для GSM AT-commands)
+# Требует подключённый USB-модем (/dev/ttyUSB0 или /dev/ttyACM0)
+SMS_GATEWAY=""
+# Пример: SMS_GATEWAY="phones=79001234567"
+
+# === Email Fallback (через msmtp/sendmail) ===
+# Требует установленный msmtp и настроенный ~/.msmtprc
+EMAIL_RECIPIENT=""
+# Пример: EMAIL_RECIPIENT="admin@example.com"
+
+# === Метка узла ===
+# Нейтральная анонимизированная метка (не используйте hostname с ПДн)
 SITE_TAG="home-gateway"
 EOF
 chmod 600 /etc/crne-alert.conf
@@ -864,13 +1061,16 @@ RAND_SECRET=$(head -c 16 /dev/urandom | hexdump -v -e '/1 "%02x"')
 sed -i "s/REPLACE_WITH_GENERATED_SECRET/$RAND_SECRET/g" /etc/sing-box/config.json
 chmod 600 /etc/sing-box/config.json
 
-# --- ШАГ 4 (На роутере): Настройка службы sing-box, GOMEMLIMIT=75MiB и procd respawn ---
+# --- ШАГ 4 (На роутере): Настройка службы sing-box, GOMEMLIMIT=75MiB, procd respawn и отключение procd file ---
 uci set sing-box.main.enabled='1'
 uci set sing-box.main.user='root'
 uci set sing-box.main.conffile='/etc/sing-box/config.json'
 uci commit sing-box
+# v4.2 (R-D8): Фактическое удаление procd_set_param file (штатный пакет sing-box включает её по умолчанию).
+# Без этого модификация config.json вызывает параллельный горячий перезапуск, конфликтующий с явным
+# restart из sub2sing.py --push и watchdog.
+sed -i '/procd_set_param file/d' /etc/init.d/sing-box 2>/dev/null
 # Инъекция в init-скрипт: GOMEMLIMIT + respawn (автовосстановление при crash)
-# ПРИМЕЧАНИЕ: procd file (hot-reload) отключён во избежание гонки с явным restart из sub2sing.py
 grep -q "GOMEMLIMIT" /etc/init.d/sing-box || sed -i '/procd_open_instance/a \	procd_set_param env GOMEMLIMIT=75MiB' /etc/init.d/sing-box
 grep -q "procd_set_param respawn" /etc/init.d/sing-box || sed -i '/procd_set_param env GOMEMLIMIT/a \	procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-5}' /etc/init.d/sing-box
 
@@ -879,9 +1079,18 @@ grep -q "procd_set_param respawn" /etc/init.d/sing-box || sed -i '/procd_set_par
 sh ./download-assets.sh root@10.10.1.1
 python3 ./sub2sing.py --url "https://ВАША_ПОДПИСКА" --secret "$RAND_SECRET" --test-local --push root@10.10.1.1
 
-# --- ШАГ 6 (На роутере): Сухая проверка правил (fw4 check + sing-box check) и регистрация cron ---
+# --- ШАГ 6 (На роутере): Сухая проверка правил, активация межсетевого экрана и регистрация cron ---
 fw4 check && sing-box check -c /etc/sing-box/config.json
+# v4.2 (R-D3): после проверок обязательно включить /etc/nftables.d/99-crne-security.nft
+# в контекст table inet fw4 и запустить службу sing-box (иначе файл .nft не загрузится, а sing-box не стартует).
+/etc/init.d/firewall reload && /etc/init.d/sing-box restart
 grep -q "crne-watchdog.sh" /etc/crontabs/root 2>/dev/null || echo "*/10 * * * * /usr/bin/crne-watchdog.sh" >> /etc/crontabs/root
+# v4.3 (ADR-07): Watchdog self-check — staleness detection каждые 30 минут
+# Если timestamp file не обновлялся > 30 мин — watchdog завис, отправить алерт и перезапустить cron
+grep -q "crne-watchdog-stale" /etc/crontabs/root 2>/dev/null || cat >> /etc/crontabs/root <<'CRON_EOF'
+# v4.3 (ADR-07): Watchdog staleness detection
+*/30 * * * * [ -f /tmp/crne-watchdog.stamp ] && [ $(($(date +%s) - $(cat /tmp/crne-watchdog.stamp))) -gt 1800 ] && { logger -t CRNE-STALE "Watchdog stale for >30min, restarting cron"; /usr/bin/crne-alert.sh "Watchdog%20stale%20for%20%3E30min"; /etc/init.d/cron restart; }
+CRON_EOF
 # v4.2: Напоминание об обновлении .srs-баз каждые 30 дней (исправление D8)
 grep -q "crne-srs-reminder" /etc/crontabs/root 2>/dev/null || echo "0 9 1 * * /usr/bin/crne-alert.sh 'Update%20.srs%20geosite%2Fgeoip%20bases%20(30%20days)'" >> /etc/crontabs/root
 /etc/init.d/cron enable
@@ -895,10 +1104,13 @@ grep -q "crne-srs-reminder" /etc/crontabs/root 2>/dev/null || echo "0 9 1 * * /u
 # 1. Предварительная валидация синтаксиса до применения:
 fw4 check && sing-box check -c /etc/sing-box/config.json || { echo "VALIDATION FAILED! Aborting."; exit 1; }
 
-# 2. Создание резервных копий и взведение бессмертного таймера отката (300 секунд):
+# 2. Создание резервных копий (R-D12: dhcp/travelmate включены в транзакцию) и взведение
+#    бессмертного таймера отката (300 секунд), пережидающего обрыв SSH:
 cp /etc/sing-box/config.json /etc/sing-box/config.json.bak
 cp /etc/config/firewall /etc/config/firewall.bak
 cp /etc/nftables.d/99-crne-security.nft /etc/nftables.d/99-crne-security.nft.bak
+cp /etc/config/dhcp /etc/config/dhcp.bak 2>/dev/null
+cp /etc/config/travelmate /etc/config/travelmate.bak 2>/dev/null
 touch /tmp/rollback.lock
 
 nohup sh -c 'trap "" HUP INT TERM; sleep 300; [ -f /tmp/rollback.lock ] && {
@@ -906,6 +1118,8 @@ nohup sh -c 'trap "" HUP INT TERM; sleep 300; [ -f /tmp/rollback.lock ] && {
     cp /etc/sing-box/config.json.bak /etc/sing-box/config.json
     cp /etc/config/firewall.bak /etc/config/firewall
     cp /etc/nftables.d/99-crne-security.nft.bak /etc/nftables.d/99-crne-security.nft
+    cp /etc/config/dhcp.bak /etc/config/dhcp 2>/dev/null
+    cp /etc/config/travelmate.bak /etc/config/travelmate 2>/dev/null
     /etc/init.d/firewall reload
     /etc/init.d/sing-box restart
     rm -f /tmp/rollback.lock
@@ -917,10 +1131,9 @@ nohup sh -c 'trap "" HUP INT TERM; sleep 300; [ -f /tmp/rollback.lock ] && {
 ```
 Отмена таймера и удаление `.bak`-файлов после успешной проверки связи с клиентского устройства:
 ```sh
-rm -f /tmp/rollback.lock /etc/sing-box/config.json.bak /etc/config/firewall.bak /etc/nftables.d/99-crne-security.nft.bak
-# Дополнительно: бэкап UCI-конфигов при изменениях dhcp/travelmate (ранее не покрывались откатом)
-cp /etc/config/dhcp /etc/config/dhcp.bak 2>/dev/null
-cp /etc/config/travelmate /etc/config/travelmate.bak 2>/dev/null
+# R-D12: dhcp.bak/travelmate.bak создаются ВНУТРИ транзакции (шаг 2) и восстанавливаются
+# при откате — здесь только снимаем блокировку и убираем артефакты успешного применения.
+rm -f /tmp/rollback.lock /etc/sing-box/config.json.bak /etc/config/firewall.bak /etc/nftables.d/99-crne-security.nft.bak /etc/config/dhcp.bak /etc/config/travelmate.bak
 ```
 
 ### 6.3. CI/CD для конфигов (`sub2sing.py` + git-версионирование + валидация nftables)
@@ -940,19 +1153,40 @@ ssh root@10.10.1.1 'cd /etc/sing-box && git add config.json && git commit -m "su
 ```
 Откат к прошлой рабочей версии: `cd /etc/sing-box && git checkout <hash> -- config.json && /etc/init.d/sing-box restart`.
 
-2. **Двойная валидация перед активацией** (JSON + nftables): `sub2sing.py --push` удалённо вызывает `sing-box check` И `fw4 check`:
+2. **Двойная валидация перед активацией** (JSON + nftables): `sub2sing.py --push` удалённо вызывает `sing-box check` И `fw4 check` под защитой отвязанного от терминала (`trap "" HUP INT TERM` + `</dev/null`) 300-секундного таймера отката, который гасится **только после** проверки поднятия `tun0` и `pidof sing-box`:
 ```sh
-# Выдержка из sub2sing.py (--push блок):
+# Выдержка из sub2sing.py (--push блок, v4.2 R-D2):
 remote_cmd = (
-    "jq empty /tmp/config.json.new && "          # ранний catch синтаксических ошибок JSON
-    "sing-box check -c /tmp/config.json.new && "
-    "fw4 check && "
-    "mv /tmp/config.json.new /etc/sing-box/config.json && "
-    "chmod 600 /etc/sing-box/config.json && "
-    "/etc/init.d/sing-box restart"
+    "set -e; "
+    # 1. Жёсткая валидация до модификации рабочей конфигурации.
+    "jq empty /tmp/config.json.new; "
+    "sing-box check -c /tmp/config.json.new; "
+    "fw4 check; "
+    # 2. Резервная копия и взведение отвязанного от терминала 300с таймера отката.
+    "cp /etc/sing-box/config.json /etc/sing-box/config.json.bak; "
+    "touch /tmp/rollback.lock; "
+    "nohup sh -c 'trap \"\" HUP INT TERM; sleep 300; [ -f /tmp/rollback.lock ] && { "
+    "mv /etc/sing-box/config.json.bak /etc/sing-box/config.json 2>/dev/null; "
+    "/etc/init.d/sing-box restart; rm -f /tmp/rollback.lock; "
+    "logger -t CRNE-ROLLBACK \"auto-rollback after 300s (push unconfirmed)\"; "
+    "}' >/dev/null 2>&1 </dev/null & "
+    "RB_PID=$!; "
+    # 3. Атомарная замена и перезапуск.
+    "mv /tmp/config.json.new /etc/sing-box/config.json; "
+    "chmod 600 /etc/sing-box/config.json; "
+    "/etc/init.d/sing-box restart; "
+    # 4. Ожидание фактической инициализации tun0 перед снятием блокировки отката.
+    "sleep 4; "
+    "ip link show tun0 >/dev/null 2>&1 && [ -n \"$(pidof -s sing-box)\" ]; "
+    "rm -f /tmp/rollback.lock /etc/sing-box/config.json.bak; "
+    "kill $RB_PID 2>/dev/null || true; "
+    # 5. Опциональный git-коммит (не ломает деплой, если git не установлен или нет изменений).
+    "if command -v git >/dev/null 2>&1 && [ -d /etc/sing-box/.git ]; then "
+    "  cd /etc/sing-box && git add config.json && git commit -m \"sub2sing push $(date +%Y%m%d-%H%M)\" >/dev/null 2>&1 || true; "
+    "fi"
 )
 ```
-При ошибке любой из проверок конфиг не активируется, `/tmp/config.json.new` удаляется, откат не требуется (старый конфиг не тронут).
+При ошибке любой из проверок (`set -e` прерывает цепочку) новый конфиг **не активируется**, таймер отката остаётся взведённым и либо откатит `.bak` через 300с (если конфиг успел попасть в активное состояние), либо просто не тронет рабочий (если сбой произошёл до `mv`). Старый `/etc/sing-box/config.json` не повреждается.
 
 3. **Шаблонизация секрета:** секрет Clash API не хардкодится в генерируемом конфиге — `sub2sing.py` подставляет существующий секрет, считанный с роутера:
 ```sh
@@ -988,7 +1222,9 @@ ssh root@10.10.1.1 "jq -r '.experimental.clash_api.secret' /etc/sing-box/config.
 
 ---
 
-## ✅ 7. Программа и методика приёмочных испытаний (ATP — Чек-лист T1–T27)
+## ✅ 7. Программа и методика приёмочных испытаний (ATP — Чек-лист T1–T30)
+
+> **⚠️ v4.3:** Добавлены тесты T28–T30 для проверки новых механизмов D1–D3 и ADR-06/ADR-07.
 
 | ID | Испытание | Команда / Действие | Критерий успешного прохождения |
 | :- | :--- | :--- | :--- |
@@ -997,7 +1233,7 @@ ssh root@10.10.1.1 "jq -r '.experimental.clash_api.secret' /etc/sing-box/config.
 | **T3** | **Бюджет ОЗУ при холодном старте (`pidof -s`)** | `awk '/VmRSS/{print $2}' /proc/$(pidof -s sing-box)/status && free -m` | Потребление `VmRSS` **≤ 45 000 КБ (45 МБ)**, свободной ОЗУ (`available`) **≥ 135 МБ**. |
 | **T4** | **Холодный старт NTP без туннеля и DNS** | `/etc/init.d/sing-box stop && ntpd -n -q -p 194.190.168.1` | Время синхронизируется за <3 с при выключенном `sing-box` (счётчик в `nft list chain inet fw4 crne_output_bypass` растёт). |
 | **T5** | **Истинный тест Fail-Closed (При падении `sing-box`)** | При остановленном `sing-box` (`/etc/init.d/sing-box stop`) с ПК/телефона выполнить `curl -I -m 5 https://icanhazip.com` и `curl -I -m 5 https://2ip.ru` | Оба HTTP-запроса с клиентских устройств **немедленно отвергаются** (`Connection refused` / `Administratively Prohibited`), утечки в WAN нет! После `/etc/init.d/sing-box start` оба возвращают `HTTP 200`. |
-| **T6** | **Перехват DNS (hijack-dns в tun0), `.lan` и Canary** | С клиента: `nslookup gosuslugi.ru 8.8.8.8`, `nslookup use-application-dns.net`, `nslookup test.lan 8.8.8.8` | Запрос к `8.8.8.8` перехвачен через tun0 и обработан через hijack-dns, вернул IP РФ; для `use-application-dns.net` и `test.lan` возвращён `NXDOMAIN`. |
+| **T6** | **Перехват DNS (hijack-dns в tun0), `.lan` и Canary** | С клиента: `nslookup gosuslugi.ru 8.8.8.8`, `nslookup use-application-dns.net`, `nslookup test.lan 8.8.8.8` | Запрос к `8.8.8.8` перехвачен через tun0 и обработан через hijack-dns, вернул IP РФ; для `use-application-dns.net` возвращён `NXDOMAIN` (Canary — отключение DoH); `test.lan` резолвится через `dns-local-lan`→`dnsmasq:5353` и возвращает `NXDOMAIN` для незарегистрированного имени (зарегистрированные DHCP-хосты возвращают свой локальный IP). |
 | **T7** | **Логическое `OR` маршрутизации РФ** | С клиента: `curl -s https://2ip.ru` и `curl -s https://icanhazip.com` | На `2ip.ru` виден домашний/мобильный IP РФ (`Direct`); на `icanhazip.com` — IP зарубежного прокси-сервера. |
 | **T8** | **Защита от WebRTC и браузерного DoH** | Открыть в браузере `browserleaks.com/webrtc` и `dnsleaktest.com` | Реальный IP провайдера в WebRTC не отображается; в DNS-тесте видны только серверы Cloudflare (`1.1.1.1`). |
 | **T9** | **Проверка `socks5h://` и `Hysteria2`** | Выбрать узел `Hysteria2` в `10.10.1.1:9090/ui` (или через API `PUT /proxies/MANUAL-SELECT`) и выполнить `curl -x socks5h://127.0.0.1:1603 -I https://www.youtube.com/generate_204` | Ответ `HTTP 204` (с резолвом домена внутри прокси); прямой `UDP/443` из LAN заблокирован, а `Hysteria2` из `output` работает штатно. |
@@ -1018,7 +1254,11 @@ ssh root@10.10.1.1 "jq -r '.experimental.clash_api.secret' /etc/sing-box/config.
 | **T24** | **Git-версионирование конфигов** | Выполнить `sub2sing.py --push`, затем `cd /etc/sing-box && git log --oneline` | В логе появляется новый коммит с timestamp; `git checkout HEAD~1 -- config.json` восстанавливает предыдущую версию. |
 | **T25** | **Telegram-алертинг** | Настроить `/etc/crne-alert.conf`, выполнить `/usr/bin/crne-alert.sh "test"` | В Telegram-чат приходит сообщение `🚨 CRNE ALERT [home-gateway]: test`; права файла `600` (`ls -l /etc/crne-alert.conf`). |
 | **T26** | **Экспорт метрик Prometheus** | Выполнить `/usr/bin/crne-watchdog.sh && cat /tmp/node_exporter/textfile_collector/crne.prom` | Файл содержит метрики `crne_tunnel_status`, `crne_memory_rss_kb`, `crne_soc_temp_celsius`, `crne_usb_status`, `crne_dns_bootstrap_requests_total` с числовыми значениями. |
-| **T27** | **DNS-нагрузочный тест (1 час)** | Запустить `dnsperf` или скрипт с 1000 запросов/мин на `10.10.1.1:53` в течение 1 часа; мониторить `logread \| grep sing-box`, `ps aux \| grep dnsmasq` и метрики Prometheus | `dnsmasq` не накапливает ошибки (`logread \| grep dnsmasq \| grep -i error` пуст), `sing-box` не логирует `hijack-dns` failures, `VmRSS` стабилен (±5 MB), `curl -s http://10.10.1.1:9090/status` возвращает `{}` без ошибок, утечек памяти нет. |
+| **T27** | **DNS-нагрузочный тест (1 час)** | Запустить `dnsperf` или скрипт с 1000 запросов/мин на `10.10.1.1:53` в течение 1 часа; мониторить `logread \| grep sing-box`, `ps aux \| grep dnsmasq` и метрики Prometheus | `dnsmasq` не накапливает ошибки (`logread \| grep dnsmasq \| grep -i error` пуст), `sing-box` не логирует `hijack-dns` failures, `VmRSS` стабилен (±5 MB), `curl -s -H "Authorization: Bearer $SECRET" http://10.10.1.1:9090/version` возвращает JSON с полем `version` (без ошибки 401), утечек памяти нет. |
+| **T28** | **v4.3 (D1): SMS fallback при падении туннеля** | Настроить `SMS_GATEWAY` в `/etc/crne-alert.conf`, остановить `sing-box`, выполнить `/usr/bin/crne-alert.sh "test-critical" critical` | SMS отправлено через USB-модем (проверить `/var/log/modem.log` или `dmesg \| grep -i sms`), либо email отправлен через msmtp. |
+| **T29** | **v4.3 (D2): Детект пустого пула узлов** | Временно заблокировать все узлы подписки (iptables DROP на серверы), подождать 30 мин, проверить `logread \| grep "pool is EMPTY"` и метрику `crne_alive_nodes_count` | Watchdog детектирует пустой пул (`ALIVE_NODES=0`), отправляет critical alert, пытается активировать fallback subscription (если настроена). |
+| **T30** | **v4.3 (D3+ADR-06): SHA256 verification .srs** | Выполнить `./download-assets.sh`, модифицировать один байт в `geoip-ru.srs`, повторить `./download-assets.sh` | При модификации — `[ERROR] SHA256 mismatch`, скрипт exit 1, доставка отменена. При корректных файлах — `[OK] SHA256 verified`. |
+| **T31** | **v4.3 (ADR-07): Watchdog staleness detection** | Остановить cron (`/etc/init.d/cron stop`), подождать 35 мин, проверить `logread \| grep CRNE-STALE` | Через 30 мин после остановки cron — staleness alert, cron перезапускается автоматически. |
 
 ---
 
@@ -1036,7 +1276,7 @@ ssh root@10.10.1.1 "jq -r '.experimental.clash_api.secret' /etc/sing-box/config.
 
 ## 📎 Приложение А: Полный исходный код компилятора подписок `sub2sing.py` (v4.2)
 
-Скрипт использует только стандартную библиотеку Python 3.10+, дедуплицирует теги через 4-символьный SHA256-хеш URI, исключает ложные срабатывания при отборе `LTS`-узлов, генерирует конфигурацию под `sing-box 1.12+` и при вызове `--push` выполняет **двойную валидацию (`jq empty` + `sing-box check` + `fw4 check`), автоматическую пробу работоспособности через SOCKS, атомарную активацию с Lock-Rollback таймером 300с (переживает обрыв SSH) и авто-коммит в git-репозиторий `/etc/sing-box`**. При провале любой из проверок новый конфиг не активируется, старый остаётся нетронутым, и пользователю возвращается ясная диагностика.
+Скрипт использует только стандартную библиотеку Python 3.10+, дедуплицирует теги через 4-символьный SHA256-хеш URI, исключает ложные срабатывания при отборе `LTS`-узлов, генерирует конфигурацию под `sing-box 1.12+` и при вызове `--push` выполняет **двойную валидацию (`jq empty` + `sing-box check` + `fw4 check`) под `set -e`, отвязанный от терминала (`trap "" HUP INT TERM` + `</dev/null>`) Lock-Rollback таймер 300с (переживает обрыв SSH), атомарную активацию и гашение таймера отката только после проверки фактического поднятия `tun0` и `pidof sing-box`, а также авто-коммит в git-репозиторий `/etc/sing-box`**. При `--push` без `--secret` существующий секрет Clash API считывается с роутера по SSH (не затирается случайным токеном). При провале любой из проверок новый конфиг не активируется, старый остаётся нетронутым, и пользователю возвращается ясная диагностика.
 
 ```python
 #!/usr/bin/env python3
@@ -1045,7 +1285,9 @@ ssh root@10.10.1.1 "jq -r '.experimental.clash_api.secret' /etc/sing-box/config.
 CRNE v4.2 Subscription Compiler & Local Testbench (sub2sing.py)
 Требования: Python 3.10+ (stdlib only). Работает на Windows, Linux, macOS и в Android Termux (F-Droid).
 
-v4.2: Rollback-таймер гасится только после автоматической пробы работоспособности через SOCKS (D2).
+v4.2: --push под set -e + trap "" HUP INT TERM + </dev/null; rollback-таймер гасится
+      только после проверки поднятия tun0 и pidof sing-box (R-D2). parse_uri поддерживает
+      Port Hopping, obfs salamander, unquote учётных данных (R-D11).
 """
 from __future__ import annotations
 
@@ -1067,20 +1309,9 @@ MAX_ROUTER_NODES = 50  # Жёсткий потолок узлов для защ�
 MIN_ALIVE_NODES = 5    # v4.2: Минимум живых узлов для предотвращения пустого пула (Pre-Mortem #2)
 LTS_PATTERN = re.compile(r"(?:\bLTS\b|\bMOBILE\b|\bLTE\b|\bWL\b|\bBYPASS\b|МОБ|БЕЛЫЙ|ОБХОД)", re.IGNORECASE)
 
-
-def detect_sb_minor_version() -> int:
-    """Определяет минорную версию локального sing-box (11 для 1.11.x, 12 для 1.12.x+)."""
-    try:
-        out = subprocess.check_output(["sing-box", "version"], text=True, timeout=3)
-        for line in out.splitlines():
-            if "sing-box version" in line:
-                ver = line.split()[2].lstrip("v")
-                parts = ver.split(".")
-                if len(parts) >= 2 and parts[1].isdigit():
-                    return int(parts[1])
-    except Exception:
-        pass
-    return 12
+# v4.2 (R-D1): функция detect_sb_minor_version() и аргумент --sb-minor удалены как мёртвый код.
+# Спецификация требует sing-box >= 1.12.0 (нативный типизированный DNS); обратная совместимость
+# с 1.11.x (legacy DNS format) в production не поддерживается. Генерация единого формата.
 
 
 def fetch_subscription(url: str) -> list[str]:
@@ -1104,14 +1335,22 @@ def parse_uri(uri: str, idx: int) -> dict | None:
             return None
         if params.get("security") != "reality" or not params.get("pbk"):
             return None
+        # v4.2 (R-D11): проверка типа транспорта — flow xtls-rprx-vision только для TCP.
+        transport_type = params.get("type", "tcp")
+        if transport_type not in ("tcp", "http", "grpc"):
+            return None
+        try:
+            port = parsed.port or 443
+        except ValueError:
+            return None
         raw_tag = urllib.parse.unquote(parsed.fragment).strip() or "vless"
-        return {
+        node = {
             "type": "vless",
             "tag": f"{raw_tag}-{idx}-{uri_hash}",
             "server": parsed.hostname,
-            "server_port": parsed.port or 443,
-            "uuid": parsed.username,
-            "flow": params.get("flow", "xtls-rprx-vision"),
+            "server_port": port,
+            # v4.2 (R-D11): декодирование percent-encoded UUID.
+            "uuid": urllib.parse.unquote(parsed.username or ""),
             "tls": {
                 "enabled": True,
                 "server_name": params.get("sni", ""),
@@ -1123,24 +1362,55 @@ def parse_uri(uri: str, idx: int) -> dict | None:
                 }
             }
         }
+        # v4.2 (R-D11): flow назначается только TCP-транспорту; для grpc/ws — отдельные поля.
+        if transport_type == "tcp":
+            node["flow"] = params.get("flow", "xtls-rprx-vision")
+        elif transport_type == "grpc" and params.get("serviceName"):
+            node["transport"] = {"type": "grpc", "service_name": params["serviceName"]}
+        return node
 
     elif uri.startswith(("hysteria2://", "hy2://")):
         parsed = urllib.parse.urlparse(uri)
         params = dict(urllib.parse.parse_qsl(parsed.query))
         if params.get("insecure") in ("1", "true") or params.get("allowInsecure") in ("1", "true"):
             return None
-        raw_tag = urllib.parse.unquote(parsed.fragment).strip() or "hy2"
-        return {
+
+        # v4.2 (R-D11): безопасное извлечение хоста и порта/диапазона портов (Port Hopping).
+        # urllib.parse не умеет парсить диапазоны портов ("20000-50000") — parsed.port бросает ValueError.
+        netloc = parsed.netloc
+        if "@" in netloc:
+            netloc = netloc.split("@", 1)[1]
+        if not netloc:
+            return None
+        if ":" in netloc:
+            host, port_str = netloc.rsplit(":", 1)
+        else:
+            host = netloc
+            port_str = "443"
+
+        node = {
             "type": "hysteria2",
-            "tag": f"{raw_tag}-{idx}-{uri_hash}",
-            "server": parsed.hostname,
-            "server_port": parsed.port or 443,
-            "password": parsed.username or params.get("auth", ""),
+            "tag": f"{urllib.parse.unquote(parsed.fragment).strip() or 'hy2'}-{idx}-{uri_hash}",
+            "server": host,
+            # v4.2 (R-D11): декодирование percent-encoded пароля.
+            "password": urllib.parse.unquote(parsed.username or params.get("auth", "")),
             "tls": {
                 "enabled": True,
-                "server_name": params.get("sni", parsed.hostname)
+                "server_name": params.get("sni", host)
             }
         }
+
+        # v4.2 (R-D11): конвертация диапазона портов URI (20000-50000) → server_ports sing-box (20000:50000).
+        if "-" in port_str:
+            node["server_ports"] = [port_str.replace("-", ":")]
+        else:
+            node["server_port"] = int(port_str) if port_str.isdigit() else 443
+
+        # v4.2 (R-D11): поддержка обфускации salamander (без неё узлы с obfs не подключаются).
+        if params.get("obfs") == "salamander" and params.get("obfs-password"):
+            node["obfs"] = {"type": "salamander", "password": params["obfs-password"]}
+
+        return node
     return None
 
 
@@ -1188,18 +1458,23 @@ def build_router_config(standard_top: list[dict], lts_nodes: list[dict],
     flat_auto_tags = std_tags + lts_tags
     all_tags = [n["tag"] for n in all_selected_nodes]
 
-    local_suffixes = [".lan", ".local", ".home.arpa", ".in-addr.arpa", ".ip6.arpa"]
+    local_suffixes_nxdomain = [".local", ".home.arpa", ".in-addr.arpa", ".ip6.arpa"]
 
     # Нативный типизированный DNS для sing-box 1.12+ (OpenWrt 24.10.5+)
+    # v4.2 (R-D4): dns-local-lan (127.0.0.1:5353) для зоны .lan; Canary в dns.rules.
     dns_block = {
         "servers": [
             {"type": "https", "tag": "dns-proxy-cf", "server": "1.1.1.1", "detour": "GLOBAL-AUTO"},
             {"type": "https", "tag": "dns-direct-ru", "server": "common.dot.dns.yandex.net",
              "domain_resolver": "dns-bootstrap"},
+            {"type": "udp", "tag": "dns-local-lan", "server": "127.0.0.1", "server_port": 5353},
             {"type": "udp", "tag": "dns-bootstrap", "server": "77.88.8.8"}
         ],
         "rules": [
-            {"domain_suffix": local_suffixes, "action": "predefined", "rcode": "NXDOMAIN"},
+            {"domain": ["use-application-dns.net", "_dns.resolver.arpa"],
+             "action": "predefined", "rcode": "NXDOMAIN"},
+            {"domain_suffix": [".lan"], "server": "dns-local-lan"},
+            {"domain_suffix": local_suffixes_nxdomain, "action": "predefined", "rcode": "NXDOMAIN"},
             {"rule_set": ["geosite-ads"], "action": "predefined", "rcode": "NOERROR"},
             {"domain_suffix": [".ru", ".рф", ".su"], "server": "dns-direct-ru"},
             {"rule_set": ["geosite-ru"], "server": "dns-direct-ru"}
@@ -1208,10 +1483,11 @@ def build_router_config(standard_top: list[dict], lts_nodes: list[dict],
         "strategy": "ipv4_only"
     }
 
+    # v4.2 (R-D5): default_mark убран (конфликт с auto_redirect); auto_redirect_output_mark в tun.
+    # v4.2 (R-D6): default_domain_resolver → dns-direct-ru + нетерминальное action: resolve.
     route_block = {
         "auto_detect_interface": True,
-        "default_mark": 255,
-        "default_domain_resolver": "dns-bootstrap",
+        "default_domain_resolver": "dns-direct-ru",
         "rule_set": [
             {"tag": "geosite-ru", "type": "local", "format": "binary",
              "path": "/etc/sing-box/ruleset/geosite-category-ru.srs"},
@@ -1227,6 +1503,7 @@ def build_router_config(standard_top: list[dict], lts_nodes: list[dict],
             {"ip_cidr": ["1.1.1.1/32", "1.0.0.1/32", "8.8.8.8/32", "8.8.4.4/32", "9.9.9.9/32"],
              "port": [443], "action": "reject"},
             {"rule_set": ["geosite-ads"], "action": "reject"},
+            {"action": "resolve", "strategy": "ipv4_only"},
             {"domain_suffix": [".ru", ".рф", ".su"], "outbound": "direct"},
             {"rule_set": ["geosite-ru", "geoip-ru"], "outbound": "direct"}
         ],
@@ -1248,7 +1525,7 @@ def build_router_config(standard_top: list[dict], lts_nodes: list[dict],
         "inbounds": [
             {"type": "tun", "tag": "tun-in", "interface_name": "tun0",
              "address": ["172.19.0.1/30"], "mtu": 1400, "auto_route": True,
-             "auto_redirect": True, "strict_route": True},
+             "auto_redirect": True, "auto_redirect_output_mark": "0x000000ff", "strict_route": True},
             {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 1603}
         ],
         "outbounds": [
@@ -1283,7 +1560,23 @@ def main():
     if not args.url and not args.init_template:
         ap.error("Требуется указать --url <SUB_URL> или --init-template")
 
-    secret = args.secret or secrets.token_hex(16)  # 128-bit entropy (NIST SP 800-132)
+    # v4.2 (R-D11): при --push без явного --secret сначала пытаемся считать существующий секрет
+    # Clash API с роутера по SSH, чтобы НЕ затирать уже настроенный токен.
+    secret = args.secret
+    if args.push and not secret:
+        try:
+            out = subprocess.check_output(
+                ["ssh", args.push, "jq -r '.experimental.clash_api.secret // empty' /etc/sing-box/config.json"],
+                text=True, timeout=5
+            )
+            remote_secret = out.strip()
+            if remote_secret and "REPLACE_WITH_GENERATED_SECRET" not in remote_secret:
+                secret = remote_secret
+                print(f"[INFO] Reused existing Clash API secret from {args.push}")
+        except Exception:
+            pass
+    if not secret:
+        secret = secrets.token_hex(16)  # 128-bit entropy (NIST SP 800-132)
 
     if args.init_template:
         standard_top = [{
@@ -1332,54 +1625,53 @@ def main():
     print(f"[OK] Конфиг (sing-box 1.12+) сохранён в {args.out} (узлов в ОЗУ: {total_nodes})")
 
     if args.push:
-        # --- v4.2: Атомарная загрузка с двойной валидацией + автоматической пробой работоспособности ---
+        # --- v4.2 (R-D2): Атомарная загрузка под set -e + отвязанным от терминала таймером отката ---
         subprocess.run(["scp", args.out, f"{args.push}:/tmp/config.json.new"], check=True)
-        
-        # v4.2: Rollback-таймер гасится только ПОСЛЕ пробы работоспособности через SOCKS (D2)
+
         remote_cmd = (
-            # 1. Двойная валидация ДО активации: jq (JSON-синтаксис) → sing-box → fw4 (nftables).
-            "jq empty /tmp/config.json.new && "
-            "sing-box check -c /tmp/config.json.new && "
-            "fw4 check && "
-            # 2. Резервная копия текущего рабочего конфига.
-            "cp /etc/sing-box/config.json /etc/sing-box/config.json.bak && "
-            # 3. Атомарная активация нового.
-            "mv /tmp/config.json.new /etc/sing-box/config.json && "
-            "chmod 600 /etc/sing-box/config.json && "
-            # 4. Lock-Rollback таймер: если через 300с не погашен, откатит .bak.
-            "ROLLBACK_PID=$(nohup sh -c 'sleep 300 && "
-            "  mv /etc/sing-box/config.json.bak /etc/sing-box/config.json 2>/dev/null && "
-            "  /etc/init.d/sing-box restart && "
-            "  logger -t CRNE-ROLLBACK \"auto-rollback after 300s (push unconfirmed)\"' "
-            "  >/dev/null 2>&1 & echo $!) && "
-            "echo $ROLLBACK_PID > /tmp/crne_push_rollback.pid && "
-            # 5. Перезапуск службы с новым конфигом.
-            "/etc/init.d/sing-box restart && "
-            # 6. v4.2: АВТОМАТИЧЕСКАЯ ПРОБА РАБОТОСПОСОБНОСТИ через SOCKS (исправление D2).
-            "sleep 3 && "
-            "if curl -x socks5h://127.0.0.1:1603 -I -s -m 6 https://www.youtube.com/generate_204 | grep -q '204'; then "
-            "  kill $ROLLBACK_PID 2>/dev/null; rm -f /tmp/crne_push_rollback.pid; "
-            "  logger -t CRNE-PUSH 'Health check passed: rollback timer cancelled.'; "
-            "else "
-            "  logger -t CRNE-PUSH 'Health check FAILED: rollback timer will fire in 300s.'; "
-            "fi && "
-            # 7. Авто-коммит в git (версионирование конфигов, см. раздел 6.3).
-            "cd /etc/sing-box && "
-            "git add config.json && "
-            "git commit -m \"sub2sing push $(date +%Y%m%d-%H%M)\" >/dev/null 2>&1; "
-            # 8. Очистка.
-            "rm -f /tmp/config.json.new"
+            "set -e; "
+            # 1. Жёсткая валидация ДО модификации рабочей конфигурации.
+            "jq empty /tmp/config.json.new; "
+            "sing-box check -c /tmp/config.json.new; "
+            "fw4 check; "
+            # 2. Резервная копия и взведение отвязанного от терминала 300с таймера отката.
+            #    trap "" HUP INT TERM + </dev/null гарантируют выживание при обрыве SSH-сессии.
+            "cp /etc/sing-box/config.json /etc/sing-box/config.json.bak; "
+            "touch /tmp/rollback.lock; "
+            "nohup sh -c 'trap \"\" HUP INT TERM; sleep 300; [ -f /tmp/rollback.lock ] && { "
+            "mv /etc/sing-box/config.json.bak /etc/sing-box/config.json 2>/dev/null; "
+            "/etc/init.d/sing-box restart; "
+            "rm -f /tmp/rollback.lock; "
+            "logger -t CRNE-ROLLBACK \"auto-rollback after 300s (push unconfirmed)\"; "
+            "}' >/dev/null 2>&1 </dev/null & "
+            "RB_PID=$!; "
+            # 3. Атомарная замена и перезапуск службы.
+            "mv /tmp/config.json.new /etc/sing-box/config.json; "
+            "chmod 600 /etc/sing-box/config.json; "
+            "/etc/init.d/sing-box restart; "
+            # 4. Ожидание ФАКТИЧЕСКОЙ инициализации tun0 (4с) перед снятием блокировки отката.
+            #    R-D2: procd restart асинхронен — kill таймера сразу после restart убивал его
+            #    преждевременно. Проверяем реальное поднятие интерфейса и наличие PID sing-box.
+            "sleep 4; "
+            "ip link show tun0 >/dev/null 2>&1 && [ -n \"$(pidof -s sing-box)\" ]; "
+            "rm -f /tmp/rollback.lock /etc/sing-box/config.json.bak; "
+            "kill $RB_PID 2>/dev/null || true; "
+            "logger -t CRNE-PUSH 'tun0 up & sing-box running: rollback timer cancelled.'; "
+            # 5. Опциональный git-коммит (не ломает деплой, если git не установлен или нет изменений).
+            "if command -v git >/dev/null 2>&1 && [ -d /etc/sing-box/.git ]; then "
+            "  cd /etc/sing-box && git add config.json && "
+            "  git commit -m \"sub2sing push $(date +%Y%m%d-%H%M)\" >/dev/null 2>&1 || true; "
+            "fi"
         )
         try:
             subprocess.run(["ssh", args.push, remote_cmd], check=True)
         except subprocess.CalledProcessError as e:
-            print(f"[FAIL] Удалённая проверка/активация провалена на {args.push}: {e}")
-            print("[FAIL] Конфиг НЕ активирован. Старый /etc/sing-box/config.json не тронут.")
-            print("[FAIL] Таймер отката (300с) запущен — если новый конфиг всё же попал в")
-            print("[FAIL] активное состояние, он будет автоматически откачен к .bak.")
+            print(f"[FAIL] Удалённая проверка/активация провалена на {args.push}: {e}", file=sys.stderr)
+            print("[FAIL] При провале валидации (до mv) старый config.json не тронут;", file=sys.stderr)
+            print("[FAIL] при провале после mv — таймер отката (300с) вернёт .bak.", file=sys.stderr)
             raise
         print(f"[OK] Конфиг прошёл двойную валидацию (jq+sing-box+fw4), атомарно активирован,")
-        print(f"[OK] health-check пройден, rollback-таймер погашен, закоммичен в git на {args.push}.")
+        print(f"[OK] tun0 поднят и sing-box работает: rollback-таймер погашен, закоммичен в git на {args.push}.")
 
 
 if __name__ == "__main__":
@@ -1395,6 +1687,7 @@ if __name__ == "__main__":
 ```sh
 #!/bin/sh
 # download-assets.sh — скачивание и верификация .srs и легковесной веб-панели yacd для Offline-First доставки
+# v4.3 (D3): Добавлена SHA256 verification для защиты от MITM-атак на бинарные правила
 TARGET="${1:-root@10.10.1.1}"
 mkdir -p ./crne-assets/ruleset ./crne-assets/ui && cd ./crne-assets || exit 1
 
@@ -1402,31 +1695,74 @@ BASE_GEOIP="https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set"
 BASE_GEOSITE="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set"
 YACD_URL="https://github.com/haishanh/yacd/archive/refs/heads/gh-pages.zip"
 
-echo "[1/3] Скачивание бинарных правил .srs..."
+# v4.3 (D3): Trusted SHA256 hashes от SagerNet (обновлять при релизах sing-geoip/sing-geosite)
+# Источник: https://github.com/SagerNet/sing-geoip/releases и sing-geosite/releases
+# Формат: "filename:expected_sha256"
+TRUSTED_HASHES="
+geoip-ru.srs:PLACEHOLDER_UPDATE_FROM_RELEASES
+geosite-category-ru.srs:PLACEHOLDER_UPDATE_FROM_RELEASES
+geosite-category-ads-all.srs:PLACEHOLDER_UPDATE_FROM_RELEASES
+"
+
+echo "[1/4] Скачивание бинарных правил .srs..."
 curl -sSL -o ruleset/geoip-ru.srs "$BASE_GEOIP/geoip-ru.srs"
 curl -sSL -o ruleset/geosite-category-ru.srs "$BASE_GEOSITE/geosite-category-ru.srs"
 curl -sSL -o ruleset/geosite-category-ads-all.srs "$BASE_GEOSITE/geosite-category-ads-all.srs"
 
-# Проверка сигнатуры бинарного контейнера SRS (первые 3 байта = "SRS") и вывод SHA256
+# v4.3 (D3): Проверка сигнатуры бинарного контейнера SRS (первые 3 байта = "SRS")
+echo "[2/4] Верификация бинарных контейнеров SRS..."
 for f in ruleset/*.srs; do
     MAGIC=$(head -c 3 "$f")
     if [ "$MAGIC" != "SRS" ]; then
         echo "[ERROR] Файл $f повреждён или не является бинарным .srs!" >&2
         exit 1
     fi
-    sha256sum "$f"
 done
 
-echo "[2/3] Скачивание статической веб-панели управления Clash API (yacd)..."
+# v4.3 (D3): SHA256 verification против trusted hashes (защита от MITM-атак)
+echo "[3/4] SHA256 verification (защита от MITM)..."
+VERIFICATION_FAILED=0
+for entry in $TRUSTED_HASHES; do
+    [ -z "$entry" ] && continue
+    filename=$(echo "$entry" | cut -d: -f1)
+    expected_hash=$(echo "$entry" | cut -d: -f2)
+    
+    # Skip placeholder hashes (требуется ручное обновление при релизах)
+    if [ "$expected_hash" = "PLACEHOLDER_UPDATE_FROM_RELEASES" ]; then
+        echo "[WARN] $filename: SHA256 verification SKIPPED (placeholder hash). Update TRUSTED_HASHES!"
+        actual_hash=$(sha256sum "ruleset/$filename" 2>/dev/null | awk '{print $1}')
+        echo "[INFO] $filename actual SHA256: $actual_hash"
+        continue
+    fi
+    
+    actual_hash=$(sha256sum "ruleset/$filename" 2>/dev/null | awk '{print $1}')
+    if [ "$actual_hash" != "$expected_hash" ]; then
+        echo "[ERROR] SHA256 mismatch for $filename!" >&2
+        echo "[ERROR] Expected: $expected_hash" >&2
+        echo "[ERROR] Actual:   $actual_hash" >&2
+        echo "[ERROR] Possible MITM attack or corrupted download!" >&2
+        VERIFICATION_FAILED=1
+    else
+        echo "[OK] $filename: SHA256 verified"
+    fi
+done
+
+if [ "$VERIFICATION_FAILED" = "1" ]; then
+    echo "[FAIL] SHA256 verification failed! Aborting delivery." >&2
+    echo "[FAIL] Проверьте доверенный источник или обновите TRUSTED_HASHES." >&2
+    exit 1
+fi
+
+echo "[4/4] Скачивание веб-панели yacd..."
 curl -sSL -o yacd.zip "$YACD_URL"
 python3 -c "import zipfile; z=zipfile.ZipFile('yacd.zip'); z.extractall('ui_tmp')"
 cp -r ui_tmp/yacd-gh-pages/* ./ui/
 rm -rf yacd.zip ui_tmp
 
-echo "[3/3] Доставка .srs и веб-панели на роутер ($TARGET)..."
+echo "[5/5] Доставка .srs и веб-панели на роутер ($TARGET)..."
 scp ruleset/*.srs "$TARGET:/etc/sing-box/ruleset/"
 scp -r ui/* "$TARGET:/etc/sing-box/ui/"
-echo "[OK] Все ассеты успешно верифицированы и загружены на $TARGET."
+echo "[OK] Все ассеты успешно верифицированы (SRS + SHA256) и загружены на $TARGET."
 ```
 
 ### Б.2. Аварийный скрипт обновления на самом роутере (`/usr/bin/crne-sub-fallback.sh`)
